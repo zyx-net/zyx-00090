@@ -1979,9 +1979,13 @@ class ReagentManagementApp:
         main_frame = ttk.Frame(frame, padding=20)
         main_frame.pack(fill='both', expand=True)
 
-        ttk.Label(main_frame, text="导入库存数据", font=('Microsoft YaHei', 14, 'bold')).pack(pady=(0, 20))
+        ttk.Label(main_frame, text="导入库存数据（方案管理）", font=('Microsoft YaHei', 14, 'bold')).pack(pady=(0, 20))
 
         has_import_perm = self.auth.has_permission("import_csv")
+        has_revert_perm = self.auth.has_permission("revert_import")
+        has_audit_perm = self.auth.has_permission("view_import_audit")
+
+        self._current_plan_id = None
 
         if not has_import_perm:
             perm_frame = ttk.Frame(main_frame)
@@ -1996,36 +2000,16 @@ class ReagentManagementApp:
                      text="如需导入数据，请联系管理员或授权用户操作。",
                      foreground='#666').pack(pady=10)
 
-            history_frame = ttk.LabelFrame(main_frame, text="导入历史记录（只读）", padding=10)
+            if has_audit_perm:
+                self._setup_audit_section(main_frame)
+
+            history_frame = ttk.LabelFrame(main_frame, text="导入方案历史（只读）", padding=10)
             history_frame.pack(fill='both', expand=True, pady=10)
-
-            history_tree = ttk.Treeview(history_frame, columns=("time", "operator", "file", "success", "skip", "status"), show='headings')
-            headings = [
-                ("time", "操作时间", 150),
-                ("operator", "操作人", 80),
-                ("file", "文件名", 200),
-                ("success", "成功", 60),
-                ("skip", "跳过", 60),
-                ("status", "状态", 80)
-            ]
-            for col, text, width in headings:
-                history_tree.heading(col, text=text)
-                history_tree.column(col, width=width, anchor='center')
-            history_tree.pack(fill='both', expand=True)
-
-            try:
-                history = self.csv_manager.get_import_history(50)
-                status_map = {"previewed": "已预检", "imported": "已导入", "cancelled": "已取消"}
-                for h in history:
-                    filename = os.path.basename(h["filepath"])
-                    history_tree.insert('', 'end', values=(
-                        h["created_at"], h["operator_name"], filename,
-                        h["success_count"], h["skip_count"],
-                        status_map.get(h["status"], h["status"])
-                    ))
-            except Exception:
-                pass
+            self._setup_plan_history_tree(history_frame, readonly=True)
+            self._refresh_plan_history()
             return
+
+        self._check_pending_drafts()
 
         file_frame = ttk.Frame(main_frame)
         file_frame.pack(fill='x', pady=(10, 5))
@@ -2042,6 +2026,7 @@ class ReagentManagementApp:
             )
             if filepath:
                 self.import_path_var.set(filepath)
+                self._current_plan_id = None
                 self._current_preview_hash = None
                 self._current_preview_result = None
                 self._update_import_buttons()
@@ -2051,23 +2036,28 @@ class ReagentManagementApp:
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(pady=10)
 
-        self.btn_preview = ttk.Button(btn_frame, text="🔍 预检导入", command=self._do_preview, width=15, state='disabled')
-        self.btn_preview.pack(side='left', padx=5, ipadx=5, ipady=8)
+        self.btn_create_plan = ttk.Button(btn_frame, text="📋 创建导入方案", command=self._do_create_plan, width=15, state='disabled')
+        self.btn_create_plan.pack(side='left', padx=5, ipadx=5, ipady=8)
 
-        self.btn_import = ttk.Button(btn_frame, text="✅ 开始导入", command=self._do_import, width=15, state='disabled')
-        self.btn_import.pack(side='left', padx=5, ipadx=5, ipady=8)
+        self.btn_confirm_import = ttk.Button(btn_frame, text="✅ 确认导入", command=self._do_confirm_import, width=15, state='disabled')
+        self.btn_confirm_import.pack(side='left', padx=5, ipadx=5, ipady=8)
 
-        self.btn_reset_preview = ttk.Button(btn_frame, text="🔄 重新预检", command=self._reset_preview, width=15, state='disabled')
-        self.btn_reset_preview.pack(side='left', padx=5, ipadx=5, ipady=8)
+        self.btn_cancel_plan = ttk.Button(btn_frame, text="❌ 取消方案", command=self._do_cancel_plan, width=15, state='disabled')
+        self.btn_cancel_plan.pack(side='left', padx=5, ipadx=5, ipady=8)
 
-        self.import_status_var = tk.StringVar(value="请选择CSV文件后点击\"预检导入\"")
+        if has_revert_perm:
+            self.btn_revert_import = ttk.Button(btn_frame, text="↩️ 撤销上次导入", command=self._do_revert_import, width=15)
+            self.btn_revert_import.pack(side='left', padx=5, ipadx=5, ipady=8)
+            self._update_revert_button()
+
+        self.import_status_var = tk.StringVar(value="请选择CSV文件后点击\"创建导入方案\"")
         status_label = ttk.Label(main_frame, textvariable=self.import_status_var, foreground='#1976D2')
         status_label.pack(pady=5)
 
         result_paned = ttk.PanedWindow(main_frame, orient='vertical')
         result_paned.pack(fill='both', expand=True, pady=5)
 
-        preview_frame = ttk.LabelFrame(result_paned, text="预检/导入结果", padding=10)
+        preview_frame = ttk.LabelFrame(result_paned, text="方案预览/导入结果", padding=10)
         result_paned.add(preview_frame, weight=3)
 
         self.preview_text = tk.Text(preview_frame, height=15, font=('Consolas', 10), wrap='none')
@@ -2077,29 +2067,48 @@ class ReagentManagementApp:
         self.preview_text.pack(side='left', fill='both', expand=True)
         preview_scroll_y.pack(side='right', fill='y')
         preview_scroll_x.pack(side='bottom', fill='x')
-        self.preview_text.insert('1.0', "预检结果将显示在这里...")
+        self.preview_text.insert('1.0', "方案预览结果将显示在这里...")
         self.preview_text.configure(state='disabled')
 
-        history_frame = ttk.LabelFrame(result_paned, text="导入历史记录", padding=10)
-        result_paned.add(history_frame, weight=2)
+        conflict_frame = ttk.LabelFrame(result_paned, text="冲突处理（如有）", padding=10)
+        result_paned.add(conflict_frame, weight=2)
 
-        self.import_history_tree = ttk.Treeview(history_frame, columns=("time", "operator", "file", "success", "skip", "status"), show='headings')
-        headings = [
-            ("time", "操作时间", 150),
-            ("operator", "操作人", 80),
-            ("file", "文件名", 200),
-            ("success", "成功", 60),
-            ("skip", "跳过", 60),
-            ("status", "状态", 80)
+        self.conflict_tree = ttk.Treeview(conflict_frame, columns=("row", "name", "batch", "type", "existing_qty", "import_qty", "resolution"), show='headings')
+        conflict_headings = [
+            ("row", "行号", 60),
+            ("name", "试剂名称", 150),
+            ("batch", "批号", 120),
+            ("type", "冲突类型", 100),
+            ("existing_qty", "现有数量", 80),
+            ("import_qty", "导入数量", 80),
+            ("resolution", "处理方式", 120)
         ]
-        for col, text, width in headings:
-            self.import_history_tree.heading(col, text=text)
-            self.import_history_tree.column(col, width=width, anchor='center')
+        for col, text, width in conflict_headings:
+            self.conflict_tree.heading(col, text=text)
+            self.conflict_tree.column(col, width=width, anchor='center')
 
-        history_scroll = ttk.Scrollbar(history_frame, orient='vertical', command=self.import_history_tree.yview)
-        self.import_history_tree.configure(yscrollcommand=history_scroll.set)
-        self.import_history_tree.pack(side='left', fill='both', expand=True)
-        history_scroll.pack(side='right', fill='y')
+        conflict_scroll = ttk.Scrollbar(conflict_frame, orient='vertical', command=self.conflict_tree.yview)
+        self.conflict_tree.configure(yscrollcommand=conflict_scroll.set)
+        self.conflict_tree.pack(side='left', fill='both', expand=True)
+        conflict_scroll.pack(side='right', fill='y')
+        self.conflict_tree.bind('<Double-1>', self._on_conflict_double_click)
+
+        conflict_btn_frame = ttk.Frame(conflict_frame)
+        conflict_btn_frame.pack(fill='x', pady=5)
+        ttk.Button(conflict_btn_frame, text="批量处理（全部保留现有）",
+                  command=lambda: self._do_resolve_all_conflicts("keep_existing")).pack(side='left', padx=5)
+        ttk.Button(conflict_btn_frame, text="批量处理（全部覆盖）",
+                  command=lambda: self._do_resolve_all_conflicts("overwrite")).pack(side='left', padx=5)
+        ttk.Button(conflict_btn_frame, text="批量处理（全部跳过）",
+                  command=lambda: self._do_resolve_all_conflicts("skip")).pack(side='left', padx=5)
+
+        plan_history_frame = ttk.LabelFrame(main_frame, text="导入方案历史", padding=10)
+        plan_history_frame.pack(fill='both', expand=True, pady=10)
+        self._setup_plan_history_tree(plan_history_frame, readonly=False)
+        self._refresh_plan_history()
+
+        if has_audit_perm:
+            self._setup_audit_section(main_frame)
 
         info = ttk.LabelFrame(main_frame, text="CSV 格式要求", padding=15)
         info.pack(fill='x', pady=10)
@@ -2111,11 +2120,9 @@ class ReagentManagementApp:
         ttk.Label(info, text="可选列：" + "、".join(optional)).pack(anchor='w', pady=2)
         ttk.Label(info, text="• 过期日期格式：YYYY-MM-DD，如 2027-12-31", wraplength=800).pack(anchor='w', pady=2)
         ttk.Label(info, text="• 数量必须是正整数", wraplength=800).pack(anchor='w', pady=2)
-        ttk.Label(info, text="• 相同名称和批号的试剂不会重复导入", wraplength=800).pack(anchor='w', pady=2)
-        ttk.Label(info, text="• 预检不写入数据库，仅用于验证数据", wraplength=800, foreground='#1976D2').pack(anchor='w', pady=2)
-        ttk.Label(info, text="• 建议先预检再导入，确认数据无误后执行导入", wraplength=800, foreground='#1976D2').pack(anchor='w', pady=2)
-
-        self._refresh_import_history()
+        ttk.Label(info, text="• 相同名称和批号的试剂需要选择处理方式（保留/覆盖/跳过）", wraplength=800).pack(anchor='w', pady=2)
+        ttk.Label(info, text="• 方案创建后不写入正式数据，确认后才会导入", wraplength=800, foreground='#1976D2').pack(anchor='w', pady=2)
+        ttk.Label(info, text="• 方案支持跨重启恢复，关闭程序后可继续查看未完成方案", wraplength=800, foreground='#1976D2').pack(anchor='w', pady=2)
 
         self.import_path_var.trace_add('write', lambda *args: self._update_import_buttons())
         self._update_import_buttons()
@@ -2365,6 +2372,560 @@ class ReagentManagementApp:
             messagebox.showinfo("成功", msg)
         except Exception as e:
             messagebox.showerror("错误", f"生成失败：{str(e)}")
+
+    def _setup_plan_history_tree(self, parent_frame, readonly=False):
+        self.plan_history_tree = ttk.Treeview(parent_frame, columns=(
+            "batch_no", "created_at", "operator", "file", "total", "new", "update",
+            "skip", "conflict", "permission", "status"
+        ), show='headings')
+
+        plan_headings = [
+            ("batch_no", "批次号", 160),
+            ("created_at", "创建时间", 150),
+            ("operator", "操作人", 80),
+            ("file", "文件名", 180),
+            ("total", "总行数", 60),
+            ("new", "新增", 50),
+            ("update", "更新", 50),
+            ("skip", "跳过", 50),
+            ("conflict", "冲突", 50),
+            ("permission", "权限受限", 70),
+            ("status", "状态", 80)
+        ]
+        for col, text, width in plan_headings:
+            self.plan_history_tree.heading(col, text=text)
+            self.plan_history_tree.column(col, width=width, anchor='center')
+
+        plan_scroll = ttk.Scrollbar(parent_frame, orient='vertical', command=self.plan_history_tree.yview)
+        self.plan_history_tree.configure(yscrollcommand=plan_scroll.set)
+        self.plan_history_tree.pack(side='left', fill='both', expand=True)
+        plan_scroll.pack(side='right', fill='y')
+
+        if not readonly:
+            self.plan_history_tree.bind('<Double-1>', self._on_plan_double_click)
+
+    def _refresh_plan_history(self):
+        if not hasattr(self, 'plan_history_tree'):
+            return
+
+        for item in self.plan_history_tree.get_children():
+            self.plan_history_tree.delete(item)
+
+        try:
+            plans = self.csv_manager.get_all_plans(50)
+            status_map = {
+                "draft": "草稿",
+                "confirmed": "已确认",
+                "cancelled": "已取消",
+                "reverted": "已撤销"
+            }
+            status_tags = {
+                "draft": "draft",
+                "confirmed": "confirmed",
+                "cancelled": "cancelled",
+                "reverted": "reverted"
+            }
+
+            for p in plans:
+                filename = os.path.basename(p["filepath"])
+                status_display = status_map.get(p["status"], p["status"])
+                tag = status_tags.get(p["status"], "")
+                self.plan_history_tree.insert('', 'end', values=(
+                    p["batch_no"], p["created_at"], p["operator_name"],
+                    filename, p["total_rows"], p["new_count"], p["update_count"],
+                    p["skip_count"], p["conflict_count"], p["permission_denied_count"],
+                    status_display
+                ), tags=(tag,), iid=str(p["id"]))
+
+            self.plan_history_tree.tag_configure('draft', background='#fff3cd')
+            self.plan_history_tree.tag_configure('confirmed', background='#d4edda')
+            self.plan_history_tree.tag_configure('cancelled', background='#e2e3e5')
+            self.plan_history_tree.tag_configure('reverted', background='#ffeeba')
+        except Exception:
+            pass
+
+    def _setup_audit_section(self, parent_frame):
+        audit_frame = ttk.LabelFrame(parent_frame, text="导入审计日志", padding=10)
+        audit_frame.pack(fill='x', pady=10)
+
+        self.audit_tree = ttk.Treeview(audit_frame, columns=(
+            "time", "operator", "action", "file", "counts"
+        ), show='headings', height=6)
+
+        audit_headings = [
+            ("time", "操作时间", 150),
+            ("operator", "操作人", 80),
+            ("action", "操作类型", 100),
+            ("file", "文件", 250),
+            ("counts", "处理数量", 150)
+        ]
+        for col, text, width in audit_headings:
+            self.audit_tree.heading(col, text=text)
+            self.audit_tree.column(col, width=width, anchor='w')
+
+        audit_scroll = ttk.Scrollbar(audit_frame, orient='vertical', command=self.audit_tree.yview)
+        self.audit_tree.configure(yscrollcommand=audit_scroll.set)
+        self.audit_tree.pack(side='left', fill='both', expand=True)
+        audit_scroll.pack(side='right', fill='y')
+
+        self._refresh_audit_logs()
+
+    def _refresh_audit_logs(self):
+        if not hasattr(self, 'audit_tree'):
+            return
+
+        for item in self.audit_tree.get_children():
+            self.audit_tree.delete(item)
+
+        try:
+            logs = self.csv_manager.get_audit_logs(limit=20)
+            action_map = {
+                "create_plan": "创建方案",
+                "confirm_import": "确认导入",
+                "cancel_plan": "取消方案",
+                "revert_import": "撤销导入"
+            }
+
+            for log in logs:
+                try:
+                    import json
+                    counts = json.loads(log["counts_summary"])
+                    counts_str = f"总{counts.get('total', 0)} 新{counts.get('new', 0)} 更{counts.get('update', 0)} 跳{counts.get('skip', 0)}"
+                except Exception:
+                    counts_str = "-"
+
+                self.audit_tree.insert('', 'end', values=(
+                    log["operation_time"], log["operator_name"],
+                    action_map.get(log["action"], log["action"]),
+                    log["file_summary"], counts_str
+                ))
+        except Exception:
+            pass
+
+    def _check_pending_drafts(self):
+        try:
+            drafts = self.csv_manager.get_pending_drafts()
+            if drafts:
+                msg = f"您有 {len(drafts)} 个未完成的导入方案。\n\n"
+                for d in drafts[:3]:
+                    msg += f"  • {d['batch_no']} - {os.path.basename(d['filepath'])}\n"
+                if len(drafts) > 3:
+                    msg += f"  ... 还有 {len(drafts) - 3} 个\n"
+                msg += "\n是否在下方历史记录中双击查看并继续？"
+                messagebox.showinfo("未完成方案", msg)
+        except Exception:
+            pass
+
+    def _on_plan_double_click(self, event):
+        item = self.plan_history_tree.selection()
+        if not item:
+            return
+
+        try:
+            plan_id = int(item[0])
+            plan = self.csv_manager.get_plan_preview(plan_id)
+            if not plan:
+                messagebox.showwarning("提示", "方案不存在或已被删除")
+                return
+
+            self._current_plan_id = plan_id
+            self._display_plan_preview(plan)
+            self._display_conflicts(plan)
+            self._update_import_buttons()
+            self.import_status_var.set(f"已加载方案：{plan['plan']['batch_no']}")
+
+        except Exception as e:
+            messagebox.showerror("错误", f"加载方案失败：{str(e)}")
+
+    def _display_plan_preview(self, plan_data):
+        summary = self.csv_manager.get_plan_summary(plan_data)
+        self._set_preview_text(summary)
+
+    def _display_conflicts(self, plan_data):
+        for item in self.conflict_tree.get_children():
+            self.conflict_tree.delete(item)
+
+        import json
+        for item in plan_data["conflict_items"]:
+            resolution = item.get("conflict_resolution")
+            resolution_display = ""
+            if resolution == "keep_existing":
+                resolution_display = "保留现有"
+            elif resolution == "overwrite":
+                resolution_display = "覆盖"
+            elif resolution == "skip":
+                resolution_display = "跳过"
+
+            existing_qty = ""
+            try:
+                if item.get("conflict_details"):
+                    details = item["conflict_details"]
+                    if isinstance(details, str):
+                        details = json.loads(details)
+                    existing_qty = details.get("existing_quantity", "")
+            except Exception:
+                pass
+
+            conflict_type_map = {
+                "duplicate_batch": "批号重复",
+                "personnel": "人员冲突",
+                "date": "日期冲突",
+                "shift": "班次冲突",
+                "role_permission": "角色权限"
+            }
+            conflict_type_display = conflict_type_map.get(item.get("conflict_type", ""), item.get("conflict_type", ""))
+
+            self.conflict_tree.insert('', 'end', values=(
+                item["row_num"], item["name"], item["batch_number"],
+                conflict_type_display, existing_qty, item["quantity"],
+                resolution_display or "待处理"
+            ), iid=str(item["id"]))
+
+    def _on_conflict_double_click(self, event):
+        selection = self.conflict_tree.selection()
+        if not selection:
+            return
+
+        item_id = int(selection[0])
+        self._show_conflict_resolution_dialog(item_id)
+
+    def _show_conflict_resolution_dialog(self, item_id):
+        item = self.csv_manager.get_plan_preview(self._current_plan_id)
+        if not item:
+            return
+
+        conflict_item = None
+        for ci in item["conflict_items"]:
+            if ci["id"] == item_id:
+                conflict_item = ci
+                break
+
+        if not conflict_item:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("冲突处理选择")
+        dialog.geometry("500x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        import json
+        try:
+            details = conflict_item.get("conflict_details")
+            if isinstance(details, str):
+                details = json.loads(details)
+        except Exception:
+            details = {}
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text="⚠️  冲突处理", font=('Microsoft YaHei', 14, 'bold')).pack(pady=(0, 15))
+
+        info_frame = ttk.LabelFrame(frame, text="冲突详情", padding=10)
+        info_frame.pack(fill='x', pady=10)
+
+        ttk.Label(info_frame, text=f"试剂名称：{conflict_item['name']}").pack(anchor='w', pady=2)
+        ttk.Label(info_frame, text=f"批号：{conflict_item['batch_number']}").pack(anchor='w', pady=2)
+        ttk.Label(info_frame, text=f"导入数量：{conflict_item['quantity']} {conflict_item['unit']}").pack(anchor='w', pady=2)
+        if details:
+            ttk.Label(info_frame, text=f"现有数量：{details.get('existing_quantity', '未知')} {details.get('existing_unit', '')}").pack(anchor='w', pady=2)
+            if details.get('existing_expiration'):
+                ttk.Label(info_frame, text=f"现有过期日期：{details['existing_expiration']}").pack(anchor='w', pady=2)
+
+        ttk.Label(frame, text="请选择处理方式：", font=('Microsoft YaHei', 11, 'bold')).pack(anchor='w', pady=(15, 10))
+
+        resolution_var = tk.StringVar(value="keep_existing")
+
+        ttk.Radiobutton(frame, text="保留现有数据（跳过此条）",
+                       variable=resolution_var, value="keep_existing").pack(anchor='w', pady=5)
+        ttk.Radiobutton(frame, text="覆盖现有数据（数量累加，其他字段更新）",
+                       variable=resolution_var, value="overwrite").pack(anchor='w', pady=5)
+        ttk.Radiobutton(frame, text="跳过此条（不导入）",
+                       variable=resolution_var, value="skip").pack(anchor='w', pady=5)
+
+        def apply_resolution():
+            try:
+                self.csv_manager.resolve_conflict(item_id, resolution_var.get())
+                plan = self.csv_manager.get_plan_preview(self._current_plan_id)
+                if plan:
+                    self._display_conflicts(plan)
+                messagebox.showinfo("成功", "冲突处理方式已保存")
+                dialog.destroy()
+                self._update_import_buttons()
+            except Exception as e:
+                messagebox.showerror("错误", f"处理失败：{str(e)}")
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=20)
+        ttk.Button(btn_frame, text="确定", command=apply_resolution, width=15).pack(side='left', padx=10)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy, width=15).pack(side='left', padx=10)
+
+    def _do_resolve_all_conflicts(self, resolution):
+        if not self._current_plan_id:
+            messagebox.showwarning("提示", "请先选择或创建导入方案")
+            return
+
+        try:
+            count = self.csv_manager.resolve_all_conflicts(self._current_plan_id, resolution)
+            plan = self.csv_manager.get_plan_preview(self._current_plan_id)
+            if plan:
+                self._display_conflicts(plan)
+            resolution_text = {"keep_existing": "保留现有", "overwrite": "覆盖", "skip": "跳过"}[resolution]
+            messagebox.showinfo("成功", f"已批量处理 {count} 条冲突（{resolution_text}）")
+            self._update_import_buttons()
+        except Exception as e:
+            messagebox.showerror("错误", f"批量处理失败：{str(e)}")
+
+    def _do_create_plan(self):
+        filepath = self.import_path_var.get().strip()
+        if not filepath:
+            messagebox.showwarning("提示", "请先选择 CSV 文件")
+            return
+        if not os.path.exists(filepath):
+            messagebox.showerror("错误", "文件不存在")
+            return
+
+        try:
+            self.set_status("正在创建导入方案...")
+            self.root.update_idletasks()
+
+            plan = self.csv_manager.create_import_plan(filepath)
+            self._current_plan_id = plan["plan_id"]
+
+            plan_data = self.csv_manager.get_plan_preview(plan["plan_id"])
+            self._display_plan_preview(plan_data)
+            self._display_conflicts(plan_data)
+            self._refresh_plan_history()
+            self._refresh_audit_logs()
+
+            msg = f"方案创建成功！\n\n批次号：{plan['batch_no']}\n\n"
+            msg += f"总行数：{plan['total_rows']}\n"
+            msg += f"新增：{plan['new_count']} 条\n"
+            msg += f"更新：{plan['update_count']} 条\n"
+            msg += f"跳过：{plan['skip_count']} 条\n"
+            msg += f"冲突：{plan['conflict_count']} 条\n"
+            msg += f"权限受限：{plan['permission_denied_count']} 条\n\n"
+
+            if plan['conflict_count'] > 0:
+                msg += "⚠️  存在冲突记录，请在下方冲突列表中双击处理，或使用批量处理按钮。\n\n"
+
+            msg += "方案已保存，关闭程序后可在历史记录中双击继续。\n"
+            msg += "确认无误后点击\"确认导入\"执行正式导入。"
+
+            messagebox.showinfo("方案创建成功", msg)
+            self.import_status_var.set(f"方案已创建：{plan['batch_no']}")
+            self._update_import_buttons()
+            self.set_status("方案创建完成")
+
+        except PermissionError as e:
+            messagebox.showerror("权限不足", str(e))
+            self.set_status("创建方案失败：权限不足")
+        except Exception as e:
+            messagebox.showerror("创建方案失败", f"{str(e)}")
+            self.set_status("创建方案失败")
+
+    def _do_confirm_import(self):
+        if not self._current_plan_id:
+            messagebox.showwarning("提示", "请先创建或选择导入方案")
+            return
+
+        plan_data = self.csv_manager.get_plan_preview(self._current_plan_id)
+        if not plan_data:
+            messagebox.showerror("错误", "方案不存在")
+            return
+
+        if plan_data["conflict_items"]:
+            messagebox.showerror("错误", f"还有 {len(plan_data['conflict_items'])} 条冲突未处理，请先处理所有冲突")
+            return
+
+        plan = plan_data["plan"]
+        if not messagebox.askyesno(
+            "确认导入",
+            f"即将确认导入方案：{plan['batch_no']}\n\n"
+            f"文件：{plan['file_summary']}\n\n"
+            f"新增：{plan['new_count']} 条\n"
+            f"更新：{plan['update_count']} 条\n"
+            f"跳过：{plan['skip_count']} 条\n"
+            f"权限受限：{plan['permission_denied_count']} 条\n\n"
+            "确认导入后将写入正式数据库，此操作可通过撤销功能恢复。\n\n"
+            "确定继续吗？"
+        ):
+            return
+
+        try:
+            self.set_status("正在执行导入...")
+            self.root.update_idletasks()
+
+            result = self.csv_manager.confirm_import_plan(self._current_plan_id)
+
+            summary = self.csv_manager.get_plan_summary(
+                self.csv_manager.get_plan_preview(self._current_plan_id)
+            )
+            self._set_preview_text(summary)
+
+            self._refresh_plan_history()
+            self._refresh_audit_logs()
+            self._refresh_import_history()
+            self.refresh_inventory()
+            self.refresh_history()
+            self.refresh_ledger()
+            self._update_revert_button()
+
+            msg = f"导入完成！\n\n"
+            msg += f"批次号：{result['batch_no']}\n"
+            msg += f"新增：{result['new_count']} 条\n"
+            msg += f"更新：{result['update_count']} 条\n"
+            msg += f"跳过：{result['skip_count']} 条\n"
+            msg += f"总计导入：{result['total_imported']} 条\n"
+
+            if result['errors']:
+                msg += f"\n错误：{len(result['errors'])} 条\n"
+
+            messagebox.showinfo("导入完成", msg)
+            self.import_status_var.set(f"✅ 导入完成：{result['batch_no']}")
+            self.set_status("导入完成")
+
+        except ValueError as e:
+            messagebox.showerror("错误", str(e))
+            self.set_status("导入失败")
+        except PermissionError as e:
+            messagebox.showerror("权限不足", str(e))
+            self.set_status("导入失败：权限不足")
+        except Exception as e:
+            messagebox.showerror("导入失败", f"{str(e)}")
+            self.set_status("导入失败")
+
+    def _do_cancel_plan(self):
+        if not self._current_plan_id:
+            messagebox.showwarning("提示", "请先选择导入方案")
+            return
+
+        if not messagebox.askyesno("确认取消", "确定要取消此导入方案吗？\n\n取消后方案将标记为已取消，无法继续使用。"):
+            return
+
+        try:
+            self.csv_manager.cancel_import_plan(self._current_plan_id)
+            self._current_plan_id = None
+            self._refresh_plan_history()
+            self._refresh_audit_logs()
+            self._set_preview_text("方案已取消")
+            for item in self.conflict_tree.get_children():
+                self.conflict_tree.delete(item)
+            messagebox.showinfo("成功", "方案已取消")
+            self.import_status_var.set("方案已取消")
+            self._update_import_buttons()
+        except Exception as e:
+            messagebox.showerror("错误", f"取消失败：{str(e)}")
+
+    def _do_revert_import(self):
+        last_import = self.csv_manager.get_last_revertable_import()
+        if not last_import:
+            messagebox.showwarning("提示", "没有可撤销的导入记录")
+            return
+
+        if not messagebox.askyesno(
+            "确认撤销",
+            f"即将撤销最近一次导入：\n\n"
+            f"批次号：{last_import['batch_no']}\n"
+            f"文件：{last_import['file_summary']}\n"
+            f"操作人：{last_import['operator_name']}\n"
+            f"时间：{last_import['confirmed_at']}\n\n"
+            f"新增：{last_import['new_count']} 条\n"
+            f"更新：{last_import['update_count']} 条\n\n"
+            "撤销后：\n"
+            "• 新增的试剂将被删除\n"
+            "• 更新的试剂将恢复到导入前状态\n"
+            "• 相关台账和操作记录将被移除\n\n"
+            "此操作不可恢复，确定继续吗？"
+        ):
+            return
+
+        try:
+            self.set_status("正在撤销导入...")
+            self.root.update_idletasks()
+
+            result = self.csv_manager.revert_last_import()
+
+            self._refresh_plan_history()
+            self._refresh_audit_logs()
+            self._refresh_import_history()
+            self.refresh_inventory()
+            self.refresh_history()
+            self.refresh_ledger()
+            self._update_revert_button()
+
+            messagebox.showinfo("撤销成功", result["message"])
+            self.set_status("撤销完成")
+
+        except PermissionError as e:
+            messagebox.showerror("权限不足", str(e))
+            self.set_status("撤销失败：权限不足")
+        except Exception as e:
+            messagebox.showerror("撤销失败", f"{str(e)}")
+            self.set_status("撤销失败")
+
+    def _update_revert_button(self):
+        if not hasattr(self, 'btn_revert_import'):
+            return
+
+        try:
+            last_import = self.csv_manager.get_last_revertable_import()
+            if last_import:
+                self.btn_revert_import.configure(state='normal')
+                self.btn_revert_import.configure(
+                    text=f"↩️ 撤销导入 ({last_import['batch_no'][:12]}...)"
+                )
+            else:
+                self.btn_revert_import.configure(state='disabled')
+                self.btn_revert_import.configure(text="↩️ 撤销上次导入")
+        except Exception:
+            self.btn_revert_import.configure(state='disabled')
+
+    def _update_import_buttons(self):
+        filepath = self.import_path_var.get().strip() if hasattr(self, 'import_path_var') else ""
+        file_exists = filepath and os.path.exists(filepath)
+        has_plan = self._current_plan_id is not None
+
+        if hasattr(self, 'btn_create_plan'):
+            self.btn_create_plan.configure(state='normal' if file_exists else 'disabled')
+
+        if hasattr(self, 'btn_confirm_import'):
+            can_confirm = False
+            if has_plan:
+                plan = self.csv_manager.get_plan_preview(self._current_plan_id)
+                if plan and plan["plan"]["status"] == "draft" and not plan["conflict_items"]:
+                    can_confirm = True
+            self.btn_confirm_import.configure(state='normal' if can_confirm else 'disabled')
+
+        if hasattr(self, 'btn_cancel_plan'):
+            can_cancel = False
+            if has_plan:
+                plan = self.csv_manager.get_plan_preview(self._current_plan_id)
+                if plan and plan["plan"]["status"] == "draft":
+                    can_cancel = True
+            self.btn_cancel_plan.configure(state='normal' if can_cancel else 'disabled')
+
+        if hasattr(self, 'import_status_var'):
+            if not filepath:
+                self.import_status_var.set("请选择CSV文件后点击\"创建导入方案\"")
+            elif not file_exists:
+                self.import_status_var.set("文件不存在，请重新选择")
+            elif has_plan:
+                plan = self.csv_manager.get_plan_preview(self._current_plan_id)
+                if plan:
+                    if plan["conflict_items"]:
+                        self.import_status_var.set(f"⚠️ 方案：{plan['plan']['batch_no']}（还有 {len(plan['conflict_items'])} 条冲突待处理）")
+                    elif plan["plan"]["status"] == "draft":
+                        self.import_status_var.set(f"✅ 方案：{plan['plan']['batch_no']}（就绪，可确认导入）")
+                    elif plan["plan"]["status"] == "confirmed":
+                        self.import_status_var.set(f"✅ 方案：{plan['plan']['batch_no']}（已确认导入）")
+                    elif plan["plan"]["status"] == "cancelled":
+                        self.import_status_var.set(f"❌ 方案：{plan['plan']['batch_no']}（已取消）")
+                    elif plan["plan"]["status"] == "reverted":
+                        self.import_status_var.set(f"↩️ 方案：{plan['plan']['batch_no']}（已撤销）")
+            else:
+                self.import_status_var.set("请点击\"创建导入方案\"生成预览方案")
 
 
 def main():

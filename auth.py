@@ -27,6 +27,8 @@ ROLE_PERMISSIONS = {
         "view_reservations": True,
         "view_reservation_logs": True,
         "release_expired_reservations": True,
+        "revert_import": True,
+        "view_import_audit": True,
     },
     "lab_staff": {
         "view_inventory": True,
@@ -52,6 +54,8 @@ ROLE_PERMISSIONS = {
         "view_reservations": True,
         "view_reservation_logs": True,
         "release_expired_reservations": False,
+        "revert_import": False,
+        "view_import_audit": False,
     },
     "auditor": {
         "view_inventory": True,
@@ -77,6 +81,8 @@ ROLE_PERMISSIONS = {
         "view_reservations": True,
         "view_reservation_logs": True,
         "release_expired_reservations": True,
+        "revert_import": True,
+        "view_import_audit": True,
     }
 }
 

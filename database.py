@@ -152,6 +152,84 @@ def init_database():
     """)
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS import_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_no TEXT UNIQUE NOT NULL,
+            filepath TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            file_summary TEXT NOT NULL,
+            total_rows INTEGER NOT NULL DEFAULT 0,
+            new_count INTEGER NOT NULL DEFAULT 0,
+            update_count INTEGER NOT NULL DEFAULT 0,
+            skip_count INTEGER NOT NULL DEFAULT 0,
+            conflict_count INTEGER NOT NULL DEFAULT 0,
+            permission_denied_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL CHECK(status IN ('draft', 'confirmed', 'cancelled', 'reverted')),
+            operator_id INTEGER NOT NULL,
+            operator_name TEXT NOT NULL,
+            confirmed_at TIMESTAMP,
+            reverted_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (operator_id) REFERENCES users(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS import_plan_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL,
+            row_num INTEGER NOT NULL,
+            action TEXT NOT NULL CHECK(action IN (
+                'new', 'update', 'skip', 'conflict', 'permission_denied'
+            )),
+            name TEXT NOT NULL,
+            batch_number TEXT NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 0,
+            unit TEXT NOT NULL,
+            expiration_date TEXT,
+            low_stock_threshold INTEGER NOT NULL DEFAULT 10,
+            specification TEXT,
+            manufacturer TEXT,
+            storage_condition TEXT,
+            remarks TEXT,
+            existing_reagent_id INTEGER,
+            conflict_type TEXT CHECK(conflict_type IN (
+                'personnel', 'date', 'shift', 'role_permission', 'duplicate_batch'
+            )),
+            conflict_details TEXT,
+            conflict_resolution TEXT CHECK(conflict_resolution IN (
+                'keep_existing', 'overwrite', 'skip'
+            )),
+            snapshot_before TEXT,
+            snapshot_after TEXT,
+            reagent_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (plan_id) REFERENCES import_plans(id) ON DELETE CASCADE,
+            FOREIGN KEY (existing_reagent_id) REFERENCES reagents(id),
+            FOREIGN KEY (reagent_id) REFERENCES reagents(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS import_audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL,
+            operator_id INTEGER NOT NULL,
+            operator_name TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN (
+                'create_plan', 'confirm_import', 'cancel_plan', 'revert_import'
+            )),
+            file_summary TEXT NOT NULL,
+            counts_summary TEXT NOT NULL,
+            conflict_resolutions TEXT,
+            operation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (plan_id) REFERENCES import_plans(id)
+        )
+    """)
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS import_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             filepath TEXT NOT NULL,
@@ -166,11 +244,56 @@ def init_database():
             operator_id INTEGER NOT NULL,
             operator_name TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('previewed', 'imported', 'cancelled')),
+            revertable INTEGER NOT NULL DEFAULT 0,
+            reverted INTEGER NOT NULL DEFAULT 0,
+            plan_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (operator_id) REFERENCES users(id)
+            FOREIGN KEY (operator_id) REFERENCES users(id),
+            FOREIGN KEY (plan_id) REFERENCES import_plans(id)
         )
     """)
+
+    cursor.execute("PRAGMA table_info(import_results)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'revertable' not in columns:
+        try:
+            cursor.execute("ALTER TABLE import_results ADD COLUMN revertable INTEGER NOT NULL DEFAULT 0")
+            cursor.execute("ALTER TABLE import_results ADD COLUMN reverted INTEGER NOT NULL DEFAULT 0")
+            cursor.execute("ALTER TABLE import_results ADD COLUMN plan_id INTEGER")
+        except Exception:
+            pass
+
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='import_results'")
+    row = cursor.fetchone()
+    if row and 'reverted' not in row[0]:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS import_results_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filepath TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                skip_count INTEGER NOT NULL DEFAULT 0,
+                total_rows INTEGER NOT NULL DEFAULT 0,
+                errors TEXT,
+                warnings TEXT,
+                conflict_batches TEXT,
+                stock_warnings TEXT,
+                operator_id INTEGER NOT NULL,
+                operator_name TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('previewed', 'imported', 'cancelled')),
+                revertable INTEGER NOT NULL DEFAULT 0,
+                reverted INTEGER NOT NULL DEFAULT 0,
+                plan_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (operator_id) REFERENCES users(id),
+                FOREIGN KEY (plan_id) REFERENCES import_plans(id)
+            )
+        """)
+        cursor.execute("INSERT INTO import_results_new (id, filepath, file_hash, success_count, skip_count, total_rows, errors, warnings, conflict_batches, stock_warnings, operator_id, operator_name, status, created_at, updated_at) SELECT id, filepath, file_hash, success_count, skip_count, total_rows, errors, warnings, conflict_batches, stock_warnings, operator_id, operator_name, status, created_at, updated_at FROM import_results")
+        cursor.execute("DROP TABLE import_results")
+        cursor.execute("ALTER TABLE import_results_new RENAME TO import_results")
 
     cursor.execute("PRAGMA table_info(reagents)")
     columns = [col[1] for col in cursor.fetchall()]
@@ -312,6 +435,16 @@ class ReagentDB:
         return dict(row) if row else None
 
     @staticmethod
+    def get_by_batch(batch_number: str) -> Optional[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reagents WHERE batch_number = ?",
+                       (batch_number,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    @staticmethod
     def update_quantity(reagent_id: int, quantity_change: int) -> bool:
         conn = get_connection()
         cursor = conn.cursor()
@@ -357,6 +490,29 @@ class ReagentDB:
             cursor.execute("DELETE FROM reagents WHERE id = ?", (reagent_id,))
             conn.commit()
             return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def restore(reagent_id: int, **kwargs) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            fields = []
+            params = []
+            allowed_fields = ["name", "batch_number", "quantity", "unit", "expiration_date",
+                             "low_stock_threshold", "specification", "manufacturer",
+                             "storage_condition", "remarks", "updated_at"]
+            for key, value in kwargs.items():
+                if key in allowed_fields:
+                    fields.append(f"{key} = ?")
+                    params.append(value)
+            if fields:
+                params.append(reagent_id)
+                cursor.execute(f"UPDATE reagents SET {', '.join(fields)} WHERE id = ?", params)
+                conn.commit()
+                return cursor.rowcount > 0
+            return False
         finally:
             conn.close()
 
@@ -923,7 +1079,8 @@ class ImportResultDB:
                total_rows: int, errors: List[str] = None, warnings: List[str] = None,
                conflict_batches: List[str] = None, stock_warnings: List[str] = None,
                operator_id: int = None, operator_name: str = "",
-               status: str = "previewed") -> int:
+               status: str = "previewed", revertable: int = 0, reverted: int = 0,
+               plan_id: int = None) -> int:
         import json
         conn = get_connection()
         cursor = conn.cursor()
@@ -932,15 +1089,15 @@ class ImportResultDB:
                 INSERT INTO import_results (
                     filepath, file_hash, success_count, skip_count, total_rows,
                     errors, warnings, conflict_batches, stock_warnings,
-                    operator_id, operator_name, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    operator_id, operator_name, status, revertable, reverted, plan_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 filepath, file_hash, success_count, skip_count, total_rows,
                 json.dumps(errors or [], ensure_ascii=False),
                 json.dumps(warnings or [], ensure_ascii=False),
                 json.dumps(conflict_batches or [], ensure_ascii=False),
                 json.dumps(stock_warnings or [], ensure_ascii=False),
-                operator_id, operator_name, status
+                operator_id, operator_name, status, revertable, reverted, plan_id
             ))
             conn.commit()
             return cursor.lastrowid
@@ -1032,6 +1189,347 @@ class ImportResultDB:
                         result[key] = json.loads(result[key])
                 results.append(result)
             return results
+        finally:
+            conn.close()
+
+
+class ImportPlanDB:
+    @staticmethod
+    def create(batch_no: str, filepath: str, file_hash: str, file_summary: str,
+               total_rows: int, operator_id: int, operator_name: str) -> int:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO import_plans (
+                    batch_no, filepath, file_hash, file_summary, total_rows,
+                    status, operator_id, operator_name
+                ) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)
+            """, (batch_no, filepath, file_hash, file_summary, total_rows,
+                  operator_id, operator_name))
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update_counts(plan_id: int, new_count: int = None, update_count: int = None,
+                      skip_count: int = None, conflict_count: int = None,
+                      permission_denied_count: int = None, total_rows: int = None) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            fields = ["updated_at = CURRENT_TIMESTAMP"]
+            params = []
+            if new_count is not None:
+                fields.append("new_count = ?")
+                params.append(new_count)
+            if update_count is not None:
+                fields.append("update_count = ?")
+                params.append(update_count)
+            if skip_count is not None:
+                fields.append("skip_count = ?")
+                params.append(skip_count)
+            if conflict_count is not None:
+                fields.append("conflict_count = ?")
+                params.append(conflict_count)
+            if permission_denied_count is not None:
+                fields.append("permission_denied_count = ?")
+                params.append(permission_denied_count)
+            if total_rows is not None:
+                fields.append("total_rows = ?")
+                params.append(total_rows)
+            params.append(plan_id)
+            cursor.execute(
+                f"UPDATE import_plans SET {', '.join(fields)} WHERE id = ?",
+                params
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update_status(plan_id: int, status: str) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            fields = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+            params = [status]
+            if status == 'confirmed':
+                fields.append("confirmed_at = CURRENT_TIMESTAMP")
+            elif status == 'reverted':
+                fields.append("reverted_at = CURRENT_TIMESTAMP")
+            params.append(plan_id)
+            cursor.execute(
+                f"UPDATE import_plans SET {', '.join(fields)} WHERE id = ?",
+                params
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_id(plan_id: int) -> Optional[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM import_plans WHERE id = ?", (plan_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_batch_no(batch_no: str) -> Optional[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM import_plans WHERE batch_no = ?", (batch_no,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_pending_drafts(operator_id: int = None) -> List[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            query = "SELECT * FROM import_plans WHERE status = 'draft'"
+            params = []
+            if operator_id:
+                query += " AND operator_id = ?"
+                params.append(operator_id)
+            query += " ORDER BY created_at DESC"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_last_revertable() -> Optional[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT * FROM import_plans
+                WHERE status = 'confirmed'
+                ORDER BY confirmed_at DESC, id DESC
+                LIMIT 1
+            """)
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_all(limit: int = 100) -> List[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT * FROM import_plans
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+
+class ImportPlanItemDB:
+    @staticmethod
+    def create(plan_id: int, row_num: int, action: str, name: str,
+               batch_number: str, quantity: int, unit: str, **kwargs) -> int:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO import_plan_items (
+                    plan_id, row_num, action, name, batch_number, quantity, unit,
+                    expiration_date, low_stock_threshold, specification, manufacturer,
+                    storage_condition, remarks, existing_reagent_id, conflict_type,
+                    conflict_details, snapshot_before
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                plan_id, row_num, action, name, batch_number, quantity, unit,
+                kwargs.get('expiration_date'),
+                kwargs.get('low_stock_threshold', 10),
+                kwargs.get('specification', ''),
+                kwargs.get('manufacturer', ''),
+                kwargs.get('storage_condition', ''),
+                kwargs.get('remarks', ''),
+                kwargs.get('existing_reagent_id'),
+                kwargs.get('conflict_type'),
+                kwargs.get('conflict_details'),
+                kwargs.get('snapshot_before')
+            ))
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update_conflict_resolution(item_id: int, resolution: str) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE import_plan_items
+                SET conflict_resolution = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (resolution, item_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update_after_import(item_id: int, reagent_id: int = None,
+                            snapshot_after: str = None, action: str = None) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            fields = ["updated_at = CURRENT_TIMESTAMP"]
+            params = []
+            if reagent_id:
+                fields.append("reagent_id = ?")
+                params.append(reagent_id)
+            if snapshot_after:
+                fields.append("snapshot_after = ?")
+                params.append(snapshot_after)
+            if action:
+                fields.append("action = ?")
+                params.append(action)
+            params.append(item_id)
+            cursor.execute(
+                f"UPDATE import_plan_items SET {', '.join(fields)} WHERE id = ?",
+                params
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_plan_id(plan_id: int) -> List[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            import json
+            cursor.execute("""
+                SELECT * FROM import_plan_items
+                WHERE plan_id = ?
+                ORDER BY row_num ASC
+            """, (plan_id,))
+            rows = cursor.fetchall()
+            items = []
+            for row in rows:
+                item = dict(row)
+                for key in ['snapshot_before', 'snapshot_after', 'conflict_details']:
+                    if item.get(key):
+                        try:
+                            item[key] = json.loads(item[key])
+                        except Exception:
+                            pass
+                items.append(item)
+            return items
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_conflicts_by_plan_id(plan_id: int) -> List[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT * FROM import_plan_items
+                WHERE plan_id = ? AND action = 'conflict'
+                ORDER BY row_num ASC
+            """, (plan_id,))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_id(item_id: int) -> Optional[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM import_plan_items WHERE id = ?", (item_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update_action(item_id: int, action: str) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE import_plan_items
+                SET action = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (action, item_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+
+class ImportAuditLogDB:
+    @staticmethod
+    def create(plan_id: int, operator_id: int, operator_name: str,
+               action: str, file_summary: str, counts_summary: str,
+               conflict_resolutions: str = None) -> int:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO import_audit_logs (
+                    plan_id, operator_id, operator_name, action,
+                    file_summary, counts_summary, conflict_resolutions
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (plan_id, operator_id, operator_name, action,
+                  file_summary, counts_summary, conflict_resolutions))
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_plan_id(plan_id: int) -> List[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT * FROM import_audit_logs
+                WHERE plan_id = ?
+                ORDER BY operation_time DESC
+            """, (plan_id,))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_all(limit: int = 100) -> List[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT * FROM import_audit_logs
+                ORDER BY operation_time DESC
+                LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
         finally:
             conn.close()
 
