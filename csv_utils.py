@@ -416,6 +416,8 @@ class CSVManager:
 
         if resolution == "overwrite":
             target_action = "update"
+        elif resolution == "keep_existing":
+            target_action = "skip"
         else:
             target_action = "skip"
 
@@ -456,6 +458,9 @@ class CSVManager:
         file_changed, _ = self.check_file_changed(plan["filepath"], plan["file_hash"])
         if file_changed:
             raise ValueError("源文件已修改，方案已失效，请重新创建方案")
+
+        if not self.auth.has_permission("import_csv"):
+            raise PermissionError("当前角色已失去导入权限，请重新登录或联系管理员")
 
         actual_new = 0
         actual_update = 0

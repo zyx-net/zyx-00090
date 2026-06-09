@@ -2153,7 +2153,9 @@ def run_tests():
             assert hasattr(app, 'btn_create_plan'), "btn_create_plan 应已创建"
             assert hasattr(app, 'btn_confirm_import'), "btn_confirm_import 应已创建"
             assert hasattr(app, 'btn_cancel_plan'), "btn_cancel_plan 应已创建"
+            assert hasattr(app, 'items_tree'), "items_tree 处理明细表格应已创建"
             assert hasattr(app, 'btn_revert_import'), "btn_revert_import 应已创建"
+            assert hasattr(app, 'items_tree'), "items_tree 处理明细表格应已创建"
 
             tab_count = len(app.notebook.tabs())
             assert tab_count == 8, f"应创建8个标签页，实际{tab_count}个"
@@ -2329,6 +2331,7 @@ def run_tests():
             assert hasattr(app, 'btn_create_plan'), "btn_create_plan 应已创建"
             assert hasattr(app, 'btn_confirm_import'), "btn_confirm_import 应已创建"
             assert hasattr(app, 'btn_cancel_plan'), "btn_cancel_plan 应已创建"
+            assert hasattr(app, 'items_tree'), "items_tree 处理明细表格应已创建"
             assert hasattr(app, 'btn_revert_import'), "btn_revert_import 应已创建"
 
             app.notebook.select(app.tab_import_export)
@@ -3275,6 +3278,407 @@ def run_tests():
         failed += 1
     except Exception as e:
         test_failed("跨重启恢复冲突处理状态", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 46: 权限拒绝不写库回归测试
+    print("\n【测试 46】权限拒绝不写库回归测试")
+    try:
+        reset_database()
+        auth.login("admin")
+
+        perm_deny_csv = os.path.join(os.path.dirname(DB_PATH), "test_regress_perm_deny.csv")
+        with open(perm_deny_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["权限拒绝测试试剂", "PERM-DENY-001", "100", "瓶"])
+
+        plan_result = csv_mgr.create_import_plan(perm_deny_csv)
+        plan_id = plan_result["plan_id"]
+
+        class FakeAuth:
+            def __init__(self):
+                self.current_user = auth.current_user
+                self.import_check_count = 0
+            def has_permission(self, perm):
+                if perm == "import_csv":
+                    self.import_check_count += 1
+                    if self.import_check_count >= 2:
+                        return False
+                    return True
+                return True
+
+        csv_mgr_fake = CSVManager(FakeAuth())
+
+        reagent_count_before = len(ReagentDB.get_all())
+        operation_count_before = len(OperationDB.get_all(1000))
+        ledger_count_before = len(LedgerDB.get_all())
+
+        try:
+            csv_mgr_fake.confirm_import_plan(plan_id)
+            test_failed("权限拒绝时确认导入", "应该失败但成功了")
+            failed += 1
+        except PermissionError as e:
+            if "失去导入权限" in str(e):
+                reagent_count_after = len(ReagentDB.get_all())
+                operation_count_after = len(OperationDB.get_all(1000))
+                ledger_count_after = len(LedgerDB.get_all())
+
+                assert reagent_count_before == reagent_count_after, "权限被拒绝时不应写入库存数据"
+                assert operation_count_before == operation_count_after, "权限被拒绝时不应写入操作日志"
+                assert ledger_count_before == ledger_count_after, "权限被拒绝时不应写入台账"
+
+                plan_after = ImportPlanDB.get_by_id(plan_id)
+                assert plan_after["status"] == "draft", "权限被拒绝时方案状态应保持draft"
+
+                test_passed("权限拒绝不写库：权限被撤销时确认导入失败，不写入任何数据")
+                passed += 1
+            else:
+                test_failed("权限拒绝时确认导入", f"异常信息不符：{e}")
+                failed += 1
+
+        os.remove(perm_deny_csv)
+    except AssertionError as e:
+        test_failed("权限拒绝不写库", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("权限拒绝不写库", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 47: 三种批量冲突处理方式回归测试
+    print("\n【测试 47】三种批量冲突处理方式回归测试")
+    try:
+        reset_database()
+        auth.login("admin")
+
+        for i in range(3):
+            manager.create_reagent(
+                f"批量处理试剂{i+1}", f"BATCH-RESOLVE-{i+1}", 100, "瓶"
+            )
+
+        batch_resolve_csv = os.path.join(os.path.dirname(DB_PATH), "test_regress_batch_resolve.csv")
+        with open(batch_resolve_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["批量处理试剂1", "BATCH-RESOLVE-1", "20", "瓶"])
+            writer.writerow(["批量处理试剂2", "BATCH-RESOLVE-2", "30", "瓶"])
+            writer.writerow(["批量处理试剂3", "BATCH-RESOLVE-3", "40", "瓶"])
+            writer.writerow(["新增试剂A", "BATCH-NEW-A", "50", "瓶"])
+
+        reagent1_before = ReagentDB.get_by_batch("BATCH-RESOLVE-1")
+        reagent2_before = ReagentDB.get_by_batch("BATCH-RESOLVE-2")
+        reagent3_before = ReagentDB.get_by_batch("BATCH-RESOLVE-3")
+        qty1_before = reagent1_before["quantity"]
+        qty2_before = reagent2_before["quantity"]
+        qty3_before = reagent3_before["quantity"]
+
+        plan_result = csv_mgr.create_import_plan(batch_resolve_csv)
+        assert plan_result["conflict_count"] == 3, f"冲突数应为3，实际{plan_result['conflict_count']}"
+
+        preview_before = csv_mgr.get_plan_preview(plan_result["plan_id"])
+        conflict_items = preview_before["conflict_items"]
+
+        csv_mgr.resolve_conflict(conflict_items[0]["id"], "overwrite")
+        csv_mgr.resolve_conflict(conflict_items[1]["id"], "keep_existing")
+        csv_mgr.resolve_conflict(conflict_items[2]["id"], "skip")
+
+        preview_after = csv_mgr.get_plan_preview(plan_result["plan_id"])
+        assert len(preview_after["unresolved_conflict_items"]) == 0, "所有冲突应已处理"
+
+        items = preview_after["items"]
+        actions = {item["batch_number"]: item["action"] for item in items}
+        assert actions["BATCH-RESOLVE-1"] == "update", "overwrite应变为update"
+        assert actions["BATCH-RESOLVE-2"] == "skip", "keep_existing应变为skip"
+        assert actions["BATCH-RESOLVE-3"] == "skip", "skip应保持skip"
+
+        import_result = csv_mgr.confirm_import_plan(plan_result["plan_id"])
+        assert import_result["update_count"] == 1, "应更新1条（overwrite）"
+        assert import_result["skip_count"] == 2, "应跳过2条（keep_existing和skip）"
+        assert import_result["new_count"] == 1, "应新增1条"
+
+        reagent1_after = ReagentDB.get_by_batch("BATCH-RESOLVE-1")
+        reagent2_after = ReagentDB.get_by_batch("BATCH-RESOLVE-2")
+        reagent3_after = ReagentDB.get_by_batch("BATCH-RESOLVE-3")
+        new_reagent = ReagentDB.get_by_batch("BATCH-NEW-A")
+
+        assert reagent1_after["quantity"] == qty1_before + 20, f"overwrite应累加数量，前{qty1_before}后{reagent1_after['quantity']}"
+        assert reagent2_after["quantity"] == qty2_before, f"keep_existing应保持数量不变，前{qty2_before}后{reagent2_after['quantity']}"
+        assert reagent3_after["quantity"] == qty3_before, f"skip应保持数量不变，前{qty3_before}后{reagent3_after['quantity']}"
+        assert new_reagent is not None, "新增试剂应存在"
+        assert new_reagent["quantity"] == 50, "新增试剂数量应为50"
+
+        audit_logs = csv_mgr.get_audit_logs(limit=10)
+        confirm_log = next((l for l in audit_logs if l["action"] == "confirm_import"), None)
+        assert confirm_log is not None, "确认导入审计日志应存在"
+
+        import json
+        conflict_resolutions = json.loads(confirm_log["conflict_resolutions"])
+        resolution_map = {r["batch_number"]: r["resolution"] for r in conflict_resolutions}
+        assert resolution_map["BATCH-RESOLVE-1"] == "overwrite", "审计日志中应为overwrite"
+        assert resolution_map["BATCH-RESOLVE-2"] == "keep_existing", "审计日志中应为keep_existing"
+        assert resolution_map["BATCH-RESOLVE-3"] == "skip", "审计日志中应为skip"
+
+        test_passed("三种批量冲突处理方式：overwrite累加、keep_existing保留、skip跳过，审计日志完整")
+        passed += 1
+
+        os.remove(batch_resolve_csv)
+    except AssertionError as e:
+        test_failed("三种批量冲突处理方式", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("三种批量冲突处理方式", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 48: 撤销后库存和历史状态恢复回归测试
+    print("\n【测试 48】撤销后库存和历史状态恢复回归测试")
+    try:
+        reset_database()
+        auth.login("admin")
+
+        existing_reagent_id, _ = manager.create_reagent(
+            "撤销测试试剂", "REVERT-001", 100, "瓶",
+            expiration_date=(datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        )
+
+        revert_csv = os.path.join(os.path.dirname(DB_PATH), "test_regress_revert.csv")
+        with open(revert_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["撤销测试试剂", "REVERT-001", "50", "瓶"])
+            writer.writerow(["撤销新增试剂", "REVERT-NEW-001", "30", "瓶"])
+            writer.writerow(["撤销新增试剂2", "REVERT-NEW-002", "40", "瓶"])
+
+        plan_result = csv_mgr.create_import_plan(revert_csv)
+        preview = csv_mgr.get_plan_preview(plan_result["plan_id"])
+        conflict_item = preview["conflict_items"][0]
+        csv_mgr.resolve_conflict(conflict_item["id"], "overwrite")
+
+        qty_before_import = ReagentDB.get_by_id(existing_reagent_id)["quantity"]
+        assert qty_before_import == 100, "导入前数量应为100"
+
+        reagent_count_before = len(ReagentDB.get_all())
+        operation_count_before = len(OperationDB.get_all(1000))
+        ledger_count_before = len(LedgerDB.get_all())
+
+        import_result = csv_mgr.confirm_import_plan(plan_result["plan_id"])
+        assert import_result["update_count"] == 1
+        assert import_result["new_count"] == 2
+
+        qty_after_import = ReagentDB.get_by_id(existing_reagent_id)["quantity"]
+        assert qty_after_import == 150, "导入后数量应为150"
+
+        reagent_count_after = len(ReagentDB.get_all())
+        operation_count_after = len(OperationDB.get_all(1000))
+        ledger_count_after = len(LedgerDB.get_all())
+        assert reagent_count_after == reagent_count_before + 2, "应新增2条试剂"
+        assert operation_count_after > operation_count_before, "应新增操作记录"
+        assert ledger_count_after > ledger_count_before, "应新增台账记录"
+
+        plan_after_import = ImportPlanDB.get_by_id(plan_result["plan_id"])
+        assert plan_after_import["status"] == "confirmed", "方案状态应为confirmed"
+
+        last_revertable = csv_mgr.get_last_revertable_import()
+        assert last_revertable is not None, "应有可撤销的导入"
+        assert last_revertable["id"] == plan_result["plan_id"], "可撤销的应是刚导入的方案"
+
+        new_reagent1 = ReagentDB.get_by_batch("REVERT-NEW-001")
+        new_reagent2 = ReagentDB.get_by_batch("REVERT-NEW-002")
+        new_reagent1_id = new_reagent1["id"]
+        new_reagent2_id = new_reagent2["id"]
+
+        revert_result = csv_mgr.revert_last_import()
+        assert revert_result["plan_id"] == plan_result["plan_id"], "撤销的方案ID应匹配"
+        assert revert_result["reverted_count"] == 3, f"应撤销3条记录，实际{revert_result['reverted_count']}"
+        assert revert_result["new_deleted"] == 2, f"应删除2条新增记录，实际{revert_result['new_deleted']}"
+        assert revert_result["updates_restored"] == 1, f"应恢复1条更新记录，实际{revert_result['updates_restored']}"
+
+        qty_after_revert = ReagentDB.get_by_id(existing_reagent_id)["quantity"]
+        assert qty_after_revert == qty_before_import, f"撤销后数量应恢复为{qty_before_import}，实际{qty_after_revert}"
+
+        reagent_count_revert = len(ReagentDB.get_all())
+        assert reagent_count_revert == reagent_count_before, "试剂总数应恢复到导入前"
+
+        assert ReagentDB.get_by_id(new_reagent1_id) is None, "新增试剂1应被删除"
+        assert ReagentDB.get_by_id(new_reagent2_id) is None, "新增试剂2应被删除"
+
+        plan_after_revert = ImportPlanDB.get_by_id(plan_result["plan_id"])
+        assert plan_after_revert["status"] == "reverted", "方案状态应为reverted"
+
+        last_revertable_after = csv_mgr.get_last_revertable_import()
+        assert last_revertable_after is None, "撤销后不应再有可撤销的导入"
+
+        audit_logs = csv_mgr.get_audit_logs(limit=10)
+        revert_log = next((l for l in audit_logs if l["action"] == "revert_import"), None)
+        assert revert_log is not None, "撤销操作审计日志应存在"
+        assert revert_log["plan_id"] == plan_result["plan_id"], "撤销日志plan_id应匹配"
+
+        plans = csv_mgr.get_all_plans(10)
+        plan_in_history = next((p for p in plans if p["id"] == plan_result["plan_id"]), None)
+        assert plan_in_history is not None, "方案应仍在历史记录中"
+        assert plan_in_history["status"] == "reverted", "历史记录中状态应为reverted"
+
+        test_passed("撤销后库存和历史状态恢复：数量恢复、新增删除、状态更新、审计完整")
+        passed += 1
+
+        os.remove(revert_csv)
+    except AssertionError as e:
+        test_failed("撤销后库存和历史状态恢复", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("撤销后库存和历史状态恢复", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 49: 重启后日志和可撤销状态恢复回归测试
+    print("\n【测试 49】重启后日志和可撤销状态恢复回归测试")
+    try:
+        reset_database()
+        auth.login("admin")
+
+        restart_log_csv = os.path.join(os.path.dirname(DB_PATH), "test_regress_restart_log.csv")
+        with open(restart_log_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["重启日志测试试剂", "RESTART-LOG-001", "100", "瓶"])
+            writer.writerow(["重启日志测试试剂2", "RESTART-LOG-002", "200", "瓶"])
+
+        plan_result = csv_mgr.create_import_plan(restart_log_csv)
+        import_result = csv_mgr.confirm_import_plan(plan_result["plan_id"])
+
+        logs_before_restart = csv_mgr.get_audit_logs(limit=10)
+        plans_before_restart = csv_mgr.get_all_plans(10)
+        last_revertable_before = csv_mgr.get_last_revertable_import()
+
+        assert len(logs_before_restart) >= 2, "重启前应有创建和确认两条审计日志"
+        assert len(plans_before_restart) >= 1, "重启前应有1个方案"
+        assert last_revertable_before is not None, "重启前应有可撤销导入"
+        assert last_revertable_before["id"] == plan_result["plan_id"]
+
+        actions_before = [l["action"] for l in logs_before_restart]
+        assert "create_plan" in actions_before, "重启前应有create_plan日志"
+        assert "confirm_import" in actions_before, "重启前应有confirm_import日志"
+
+        import json
+        confirm_log_before = next((l for l in logs_before_restart if l["action"] == "confirm_import"), None)
+        counts_before = json.loads(confirm_log_before["counts_summary"])
+
+        close_db()
+        init_database()
+        auth.login("admin")
+        csv_mgr_restart = CSVManager(auth)
+
+        logs_after_restart = csv_mgr_restart.get_audit_logs(limit=10)
+        plans_after_restart = csv_mgr_restart.get_all_plans(10)
+        last_revertable_after = csv_mgr_restart.get_last_revertable_import()
+
+        assert len(logs_after_restart) == len(logs_before_restart), "重启后审计日志数量应相同"
+        assert len(plans_after_restart) == len(plans_before_restart), "重启后方案数量应相同"
+        assert last_revertable_after is not None, "重启后可撤销状态应恢复"
+        assert last_revertable_after["id"] == plan_result["plan_id"], "重启后可撤销方案ID应匹配"
+        assert last_revertable_after["status"] == "confirmed", "重启后方案状态应为confirmed"
+
+        actions_after = [l["action"] for l in logs_after_restart]
+        assert "create_plan" in actions_after, "重启后应有create_plan日志"
+        assert "confirm_import" in actions_after, "重启后应有confirm_import日志"
+
+        confirm_log_after = next((l for l in logs_after_restart if l["action"] == "confirm_import"), None)
+        assert confirm_log_after is not None, "重启后确认日志应存在"
+        assert confirm_log_after["plan_id"] == plan_result["plan_id"], "重启后日志plan_id应匹配"
+        assert confirm_log_after["operator_id"] == confirm_log_before["operator_id"], "重启后操作人应相同"
+        assert confirm_log_after["file_summary"] == confirm_log_before["file_summary"], "重启后文件摘要应相同"
+
+        counts_after = json.loads(confirm_log_after["counts_summary"])
+        assert counts_after["total"] == counts_before["total"], "重启后统计总数应相同"
+        assert counts_after["new"] == counts_before["new"], "重启后新增数应相同"
+        assert counts_after["skip"] == counts_before["skip"], "重启后跳过数应相同"
+
+        plan_in_history = next((p for p in plans_after_restart if p["id"] == plan_result["plan_id"]), None)
+        assert plan_in_history is not None, "重启后方案应在历史记录中"
+        assert plan_in_history["batch_no"] == plan_result["batch_no"], "重启后批次号应相同"
+        assert plan_in_history["new_count"] == import_result["new_count"], "重启后新增数应相同"
+        assert plan_in_history["status"] == "confirmed", "重启后方案状态应为confirmed"
+
+        plan_preview = csv_mgr_restart.get_plan_preview(plan_result["plan_id"])
+        assert plan_preview is not None, "重启后应能获取方案预览"
+        assert len(plan_preview["items"]) == 2, "重启后方案条目应完整"
+        assert plan_preview["plan"]["status"] == "confirmed", "重启后预览中状态应为confirmed"
+
+        revert_result = csv_mgr_restart.revert_last_import()
+        assert revert_result["plan_id"] == plan_result["plan_id"], "重启后应能成功撤销"
+
+        last_revertable_after_revert = csv_mgr_restart.get_last_revertable_import()
+        assert last_revertable_after_revert is None, "重启后撤销后不应再有可撤销导入"
+
+        plan_after_revert = ImportPlanDB.get_by_id(plan_result["plan_id"])
+        assert plan_after_revert["status"] == "reverted", "重启后撤销后状态应为reverted"
+
+        audit_logs_final = csv_mgr_restart.get_audit_logs(limit=10)
+        revert_log = next((l for l in audit_logs_final if l["action"] == "revert_import"), None)
+        assert revert_log is not None, "重启后撤销操作应记录审计日志"
+
+        test_passed("重启后日志和可撤销状态恢复：审计日志、方案历史、可撤销状态均正确恢复")
+        passed += 1
+
+        os.remove(restart_log_csv)
+    except AssertionError as e:
+        test_failed("重启后日志和可撤销状态恢复", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("重启后日志和可撤销状态恢复", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 50: 文件变化检测回归测试
+    print("\n【测试 50】文件变化检测回归测试")
+    try:
+        reset_database()
+        auth.login("admin")
+
+        file_change_csv = os.path.join(os.path.dirname(DB_PATH), "test_regress_file_change.csv")
+        with open(file_change_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["文件变化测试试剂", "FILE-CHANGE-001", "100", "瓶"])
+
+        plan_result = csv_mgr.create_import_plan(file_change_csv)
+        plan_id = plan_result["plan_id"]
+        expected_hash = plan_result["file_hash"]
+
+        file_changed, current_hash = csv_mgr.check_file_changed(file_change_csv, expected_hash)
+        assert not file_changed, "文件未修改时应检测为未变化"
+
+        import time
+        time.sleep(1)
+        with open(file_change_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["文件变化测试试剂", "FILE-CHANGE-001", "200", "瓶"])
+
+        file_changed2, current_hash2 = csv_mgr.check_file_changed(file_change_csv, expected_hash)
+        assert file_changed2, "文件修改后应检测为已变化"
+        assert current_hash2 != expected_hash, "文件哈希应不同"
+
+        try:
+            csv_mgr.confirm_import_plan(plan_id)
+            test_failed("文件变化后确认导入", "应该失败但成功了")
+            failed += 1
+        except ValueError as e:
+            if "源文件已修改" in str(e):
+                plan_after = ImportPlanDB.get_by_id(plan_id)
+                assert plan_after["status"] == "draft", "文件变化时方案状态应保持draft"
+
+                reagent_count = len(ReagentDB.get_all())
+                assert reagent_count == 0, "文件变化时不应写入任何数据"
+
+                test_passed("文件变化检测：确认导入前检测到文件修改时拒绝导入，不写入数据")
+                passed += 1
+            else:
+                test_failed("文件变化后确认导入", f"异常信息不符：{e}")
+                failed += 1
+
+        os.remove(file_change_csv)
+    except AssertionError as e:
+        test_failed("文件变化检测", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("文件变化检测", str(e) if str(e) else "未知错误")
         failed += 1
 
     # 清理测试数据库

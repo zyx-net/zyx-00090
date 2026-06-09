@@ -2058,9 +2058,9 @@ class ReagentManagementApp:
         result_paned.pack(fill='both', expand=True, pady=5)
 
         preview_frame = ttk.LabelFrame(result_paned, text="方案预览/导入结果", padding=10)
-        result_paned.add(preview_frame, weight=3)
+        result_paned.add(preview_frame, weight=2)
 
-        self.preview_text = tk.Text(preview_frame, height=15, font=('Consolas', 10), wrap='none')
+        self.preview_text = tk.Text(preview_frame, height=12, font=('Consolas', 10), wrap='none')
         preview_scroll_y = ttk.Scrollbar(preview_frame, orient='vertical', command=self.preview_text.yview)
         preview_scroll_x = ttk.Scrollbar(preview_frame, orient='horizontal', command=self.preview_text.xview)
         self.preview_text.configure(yscrollcommand=preview_scroll_y.set, xscrollcommand=preview_scroll_x.set)
@@ -2069,6 +2069,35 @@ class ReagentManagementApp:
         preview_scroll_x.pack(side='bottom', fill='x')
         self.preview_text.insert('1.0', "方案预览结果将显示在这里...")
         self.preview_text.configure(state='disabled')
+
+        items_frame = ttk.LabelFrame(result_paned, text="处理明细（逐条记录）", padding=10)
+        result_paned.add(items_frame, weight=3)
+
+        self.items_tree = ttk.Treeview(items_frame, columns=(
+            "row", "name", "batch", "quantity", "action", "conflict_type",
+            "conflict_reason", "resolution", "result"
+        ), show='headings')
+        items_headings = [
+            ("row", "行号", 60),
+            ("name", "试剂名称", 140),
+            ("batch", "批号", 110),
+            ("quantity", "数量", 70),
+            ("action", "动作", 80),
+            ("conflict_type", "冲突类型", 90),
+            ("conflict_reason", "冲突原因", 180),
+            ("resolution", "处理方式", 100),
+            ("result", "处理结果", 100)
+        ]
+        for col, text, width in items_headings:
+            self.items_tree.heading(col, text=text)
+            self.items_tree.column(col, width=width, anchor='center')
+
+        items_scroll_y = ttk.Scrollbar(items_frame, orient='vertical', command=self.items_tree.yview)
+        items_scroll_x = ttk.Scrollbar(items_frame, orient='horizontal', command=self.items_tree.xview)
+        self.items_tree.configure(yscrollcommand=items_scroll_y.set, xscrollcommand=items_scroll_x.set)
+        self.items_tree.pack(side='left', fill='both', expand=True)
+        items_scroll_y.pack(side='right', fill='y')
+        items_scroll_x.pack(side='bottom', fill='x')
 
         conflict_frame = ttk.LabelFrame(result_paned, text="冲突处理（如有）", padding=10)
         result_paned.add(conflict_frame, weight=2)
@@ -2530,6 +2559,7 @@ class ReagentManagementApp:
 
             self._current_plan_id = plan_id
             self._display_plan_preview(plan)
+            self._display_items(plan)
             self._display_conflicts(plan)
             self._update_import_buttons()
             self.import_status_var.set(f"已加载方案：{plan['plan']['batch_no']}")
@@ -2540,6 +2570,83 @@ class ReagentManagementApp:
     def _display_plan_preview(self, plan_data):
         summary = self.csv_manager.get_plan_summary(plan_data)
         self._set_preview_text(summary)
+
+    def _display_items(self, plan_data):
+        for item in self.items_tree.get_children():
+            self.items_tree.delete(item)
+
+        import json
+        action_map = {
+            "new": "新增",
+            "update": "更新",
+            "skip": "跳过",
+            "conflict": "冲突",
+            "permission_denied": "权限受限"
+        }
+        resolution_map = {
+            "keep_existing": "保留现有",
+            "overwrite": "覆盖",
+            "skip": "跳过"
+        }
+        conflict_type_map = {
+            "duplicate_batch": "批号重复",
+            "personnel": "人员冲突",
+            "date": "日期冲突",
+            "shift": "班次冲突",
+            "role_permission": "角色权限"
+        }
+
+        for item in plan_data["items"]:
+            action_display = action_map.get(item.get("action", ""), item.get("action", ""))
+            conflict_type_display = conflict_type_map.get(item.get("conflict_type", ""), item.get("conflict_type", ""))
+            resolution_display = resolution_map.get(item.get("conflict_resolution", ""), item.get("conflict_resolution", ""))
+
+            conflict_reason = ""
+            try:
+                if item.get("conflict_details"):
+                    details = item["conflict_details"]
+                    if isinstance(details, str):
+                        details = json.loads(details)
+                    if item.get("conflict_type") == "duplicate_batch":
+                        conflict_reason = f"已存在：{details.get('existing_quantity', '')}{details.get('existing_unit', '')}"
+                    else:
+                        conflict_reason = str(details)[:50]
+            except Exception:
+                pass
+
+            result_display = ""
+            if item.get("action") in ["new", "update"] and plan_data["plan"]["status"] == "confirmed":
+                result_display = "已导入" if item.get("reagent_id") else "失败"
+            elif item.get("action") == "skip":
+                result_display = "已跳过"
+            elif item.get("action") == "conflict":
+                result_display = "待处理"
+            elif item.get("action") == "permission_denied":
+                result_display = "无权限"
+
+            tags = []
+            if item.get("action") == "new":
+                tags.append("item_new")
+            elif item.get("action") == "update":
+                tags.append("item_update")
+            elif item.get("action") == "skip":
+                tags.append("item_skip")
+            elif item.get("action") == "conflict":
+                tags.append("item_conflict")
+            elif item.get("action") == "permission_denied":
+                tags.append("item_permission")
+
+            self.items_tree.insert('', 'end', values=(
+                item["row_num"], item.get("name", ""), item.get("batch_number", ""),
+                item.get("quantity", ""), action_display, conflict_type_display,
+                conflict_reason, resolution_display, result_display
+            ), tags=tuple(tags))
+
+        self.items_tree.tag_configure('item_new', background='#d4edda')
+        self.items_tree.tag_configure('item_update', background='#cce5ff')
+        self.items_tree.tag_configure('item_skip', background='#e2e3e5')
+        self.items_tree.tag_configure('item_conflict', background='#fff3cd')
+        self.items_tree.tag_configure('item_permission', background='#f8d7da')
 
     def _display_conflicts(self, plan_data):
         for item in self.conflict_tree.get_children():
@@ -2649,6 +2756,7 @@ class ReagentManagementApp:
                 self.csv_manager.resolve_conflict(item_id, resolution_var.get())
                 plan = self.csv_manager.get_plan_preview(self._current_plan_id)
                 if plan:
+                    self._display_items(plan)
                     self._display_conflicts(plan)
                 messagebox.showinfo("成功", "冲突处理方式已保存")
                 dialog.destroy()
@@ -2670,6 +2778,7 @@ class ReagentManagementApp:
             count = self.csv_manager.resolve_all_conflicts(self._current_plan_id, resolution)
             plan = self.csv_manager.get_plan_preview(self._current_plan_id)
             if plan:
+                self._display_items(plan)
                 self._display_conflicts(plan)
             resolution_text = {"keep_existing": "保留现有", "overwrite": "覆盖", "skip": "跳过"}[resolution]
             messagebox.showinfo("成功", f"已批量处理 {count} 条冲突（{resolution_text}）")
@@ -2695,6 +2804,7 @@ class ReagentManagementApp:
 
             plan_data = self.csv_manager.get_plan_preview(plan["plan_id"])
             self._display_plan_preview(plan_data)
+            self._display_items(plan_data)
             self._display_conflicts(plan_data)
             self._refresh_plan_history()
             self._refresh_audit_logs()
