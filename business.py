@@ -2,8 +2,9 @@ import json
 from typing import Dict, Optional, Tuple, List
 from datetime import datetime
 
-from database import ReagentDB, OperationDB, LedgerDB, UserDB
-from auth import AuthManager, OPERATION_TYPE_DISPLAY
+from database import (ReagentDB, OperationDB, LedgerDB, UserDB,
+                      ReservationDB, ReservationLogDB, ReagentLockDB)
+from auth import AuthManager, OPERATION_TYPE_DISPLAY, RESERVATION_OPERATION_DISPLAY
 
 
 class OperationError(Exception):
@@ -465,3 +466,603 @@ class ReagentManager:
         if success:
             return True, "试剂信息更新成功"
         return False, "试剂信息更新失败"
+
+    def create_reservation(self, reagent_id: int, quantity: int,
+                           planned_use_date: str, remarks: str = "") -> Tuple[int, str]:
+        self._check_permission("create_reservation")
+
+        if quantity <= 0:
+            raise OperationError("预约数量必须大于0")
+
+        reagent = ReagentDB.get_by_id(reagent_id)
+        if not reagent:
+            raise OperationError("试剂不存在")
+
+        if ReagentDB.is_expired(reagent_id):
+            raise OperationError(f"试剂已过期（过期日期：{reagent['expiration_date']}），禁止预约")
+
+        available_qty = ReagentLockDB.get_available_quantity(reagent_id)
+        if available_qty < quantity:
+            raise OperationError(
+                f"可用库存不足。当前库存：{reagent['quantity']}，"
+                f"已锁定：{reagent.get('locked_quantity', 0)}，"
+                f"可用：{available_qty}，需要：{quantity}"
+            )
+
+        try:
+            datetime.strptime(planned_use_date, "%Y-%m-%d")
+        except ValueError:
+            raise OperationError("计划使用日期格式错误，请使用 YYYY-MM-DD 格式")
+
+        if planned_use_date < datetime.now().strftime("%Y-%m-%d"):
+            raise OperationError("计划使用日期不能早于今天")
+
+        reservation_id = ReservationDB.create(
+            reagent_id=reagent_id,
+            reagent_name=reagent["name"],
+            batch_number=reagent["batch_number"],
+            quantity=quantity,
+            planned_use_date=planned_use_date,
+            operator_id=self.auth.current_user["id"],
+            remarks=remarks
+        )
+
+        ReservationLogDB.create(
+            operation_type="create",
+            reservation_id=reservation_id,
+            reagent_id=reagent_id,
+            reagent_name=reagent["name"],
+            batch_number=reagent["batch_number"],
+            quantity=quantity,
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            status_before=None,
+            status_after="pending",
+            remarks=remarks,
+            revertable=0
+        )
+
+        return reservation_id, (
+            f"预约已提交，等待审核：{reagent['name']} ({reagent['batch_number']}) "
+            f"{quantity} {reagent['unit']}，计划使用日期：{planned_use_date}"
+        )
+
+    def approve_reservation(self, reservation_id: int,
+                            review_remarks: str = "") -> Tuple[int, str]:
+        self._check_permission("approve_reservation")
+
+        reservation = ReservationDB.get_by_id(reservation_id)
+        if not reservation:
+            raise OperationError("预约记录不存在")
+
+        if reservation["status"] != "pending":
+            raise OperationError(
+                f"当前状态为「{reservation['status']}」，无法审批"
+            )
+
+        reagent = ReagentDB.get_by_id(reservation["reagent_id"])
+        if not reagent:
+            raise OperationError("关联试剂不存在")
+
+        if ReagentDB.is_expired(reservation["reagent_id"]):
+            raise OperationError(
+                f"试剂已过期（过期日期：{reagent['expiration_date']}），禁止通过审批"
+            )
+
+        available_qty = ReagentLockDB.get_available_quantity(reservation["reagent_id"])
+        if available_qty < reservation["quantity"]:
+            raise OperationError(
+                f"可用库存不足。当前库存：{reagent['quantity']}，"
+                f"已锁定：{reagent.get('locked_quantity', 0)}，"
+                f"可用：{available_qty}，需要：{reservation['quantity']}"
+            )
+
+        snapshot_before = json.dumps(reagent, ensure_ascii=False)
+
+        if not ReagentLockDB.update_locked_quantity(
+            reservation["reagent_id"], reservation["quantity"]
+        ):
+            raise OperationError("审批失败，库存锁定更新错误")
+
+        reagent_after = ReagentDB.get_by_id(reservation["reagent_id"])
+        snapshot_after = json.dumps(reagent_after, ensure_ascii=False)
+
+        ReservationDB.update_status(
+            reservation_id, "approved",
+            reviewer_id=self.auth.current_user["id"],
+            review_remarks=review_remarks
+        )
+
+        log_id = ReservationLogDB.create(
+            operation_type="approve",
+            reservation_id=reservation_id,
+            reagent_id=reservation["reagent_id"],
+            reagent_name=reservation["reagent_name"],
+            batch_number=reservation["batch_number"],
+            quantity=reservation["quantity"],
+            operator_id=reservation["operator_id"],
+            operator_name=reservation.get("operator_name", ""),
+            reviewer_id=self.auth.current_user["id"],
+            reviewer_name=self.auth.current_user["display_name"],
+            status_before="pending",
+            status_after="approved",
+            locked_qty_change=reservation["quantity"],
+            remarks=review_remarks,
+            revertable=1,
+            snapshot_before=snapshot_before,
+            snapshot_after=snapshot_after
+        )
+
+        return log_id, (
+            f"审批通过，已锁定库存：{reservation['reagent_name']} "
+            f"({reservation['batch_number']}) {reservation['quantity']} "
+            f"{reagent.get('unit', '')}"
+        )
+
+    def reject_reservation(self, reservation_id: int,
+                           review_remarks: str = "") -> Tuple[int, str]:
+        self._check_permission("reject_reservation")
+
+        reservation = ReservationDB.get_by_id(reservation_id)
+        if not reservation:
+            raise OperationError("预约记录不存在")
+
+        if reservation["status"] != "pending":
+            raise OperationError(
+                f"当前状态为「{reservation['status']}」，无法拒绝"
+            )
+
+        ReservationDB.update_status(
+            reservation_id, "rejected",
+            reviewer_id=self.auth.current_user["id"],
+            review_remarks=review_remarks
+        )
+
+        log_id = ReservationLogDB.create(
+            operation_type="reject",
+            reservation_id=reservation_id,
+            reagent_id=reservation["reagent_id"],
+            reagent_name=reservation["reagent_name"],
+            batch_number=reservation["batch_number"],
+            quantity=reservation["quantity"],
+            operator_id=reservation["operator_id"],
+            operator_name=reservation.get("operator_name", ""),
+            reviewer_id=self.auth.current_user["id"],
+            reviewer_name=self.auth.current_user["display_name"],
+            status_before="pending",
+            status_after="rejected",
+            remarks=review_remarks,
+            revertable=0
+        )
+
+        return log_id, f"已拒绝预约申请：{review_remarks}"
+
+    def reschedule_reservation(self, reservation_id: int,
+                               new_planned_date: str,
+                               review_remarks: str = "") -> Tuple[int, str]:
+        self._check_permission("reschedule_reservation")
+
+        reservation = ReservationDB.get_by_id(reservation_id)
+        if not reservation:
+            raise OperationError("预约记录不存在")
+
+        if reservation["status"] not in ["pending", "approved"]:
+            raise OperationError(
+                f"当前状态为「{reservation['status']}」，无法改期"
+            )
+
+        try:
+            datetime.strptime(new_planned_date, "%Y-%m-%d")
+        except ValueError:
+            raise OperationError("新计划使用日期格式错误，请使用 YYYY-MM-DD 格式")
+
+        if new_planned_date < datetime.now().strftime("%Y-%m-%d"):
+            raise OperationError("新计划使用日期不能早于今天")
+
+        old_date = reservation["planned_use_date"]
+        ReservationDB.update_status(
+            reservation_id, "rescheduled",
+            reviewer_id=self.auth.current_user["id"],
+            review_remarks=review_remarks,
+            planned_use_date=new_planned_date
+        )
+
+        new_reservation_id = ReservationDB.create(
+            reagent_id=reservation["reagent_id"],
+            reagent_name=reservation["reagent_name"],
+            batch_number=reservation["batch_number"],
+            quantity=reservation["quantity"],
+            planned_use_date=new_planned_date,
+            operator_id=reservation["operator_id"],
+            remarks=f"由预约#{reservation_id}改期而来，原日期：{old_date}",
+            original_planned_date=old_date
+        )
+
+        if reservation["status"] == "approved":
+            reagent = ReagentDB.get_by_id(reservation["reagent_id"])
+            snapshot_before = json.dumps(reagent, ensure_ascii=False)
+            ReagentLockDB.update_locked_quantity(reservation["reagent_id"], reservation["quantity"])
+            reagent_after = ReagentDB.get_by_id(reservation["reagent_id"])
+            snapshot_after = json.dumps(reagent_after, ensure_ascii=False)
+
+            ReservationDB.update_status(
+                new_reservation_id, "approved",
+                reviewer_id=self.auth.current_user["id"],
+                review_remarks=f"改期自动审批，原预约#{reservation_id}"
+            )
+
+            ReservationLogDB.create(
+                operation_type="approve",
+                reservation_id=new_reservation_id,
+                reagent_id=reservation["reagent_id"],
+                reagent_name=reservation["reagent_name"],
+                batch_number=reservation["batch_number"],
+                quantity=reservation["quantity"],
+                operator_id=reservation["operator_id"],
+                operator_name=reservation.get("operator_name", ""),
+                reviewer_id=self.auth.current_user["id"],
+                reviewer_name=self.auth.current_user["display_name"],
+                status_before="pending",
+                status_after="approved",
+                locked_qty_change=reservation["quantity"],
+                remarks=f"改期自动审批，原预约#{reservation_id}",
+                revertable=1,
+                snapshot_before=snapshot_before,
+                snapshot_after=snapshot_after
+            )
+
+        log_id = ReservationLogDB.create(
+            operation_type="reschedule",
+            reservation_id=reservation_id,
+            reagent_id=reservation["reagent_id"],
+            reagent_name=reservation["reagent_name"],
+            batch_number=reservation["batch_number"],
+            quantity=reservation["quantity"],
+            operator_id=reservation["operator_id"],
+            operator_name=reservation.get("operator_name", ""),
+            reviewer_id=self.auth.current_user["id"],
+            reviewer_name=self.auth.current_user["display_name"],
+            status_before=reservation["status"],
+            status_after="rescheduled",
+            remarks=f"改期：{old_date} → {new_planned_date}。{review_remarks}",
+            revertable=0
+        )
+
+        return log_id, (
+            f"改期成功：{old_date} → {new_planned_date}，"
+            f"新预约ID：#{new_reservation_id}"
+        )
+
+    def cancel_reservation(self, reservation_id: int,
+                           remarks: str = "") -> Tuple[int, str]:
+        self._check_permission("cancel_reservation")
+
+        reservation = ReservationDB.get_by_id(reservation_id)
+        if not reservation:
+            raise OperationError("预约记录不存在")
+
+        if reservation["status"] not in ["pending", "approved"]:
+            raise OperationError(
+                f"当前状态为「{reservation['status']}」，无法取消"
+            )
+
+        if (reservation["operator_id"] != self.auth.current_user["id"]
+                and not self.auth.has_permission("approve_reservation")):
+            raise OperationError("只能取消自己创建的预约，或需要管理员权限")
+
+        reagent = ReagentDB.get_by_id(reservation["reagent_id"])
+        snapshot_before = json.dumps(reagent, ensure_ascii=False) if reagent else ""
+
+        locked_change = 0
+        if reservation["status"] == "approved":
+            if not ReagentLockDB.update_locked_quantity(
+                reservation["reagent_id"], -reservation["quantity"]
+            ):
+                raise OperationError("取消失败，库存锁定释放错误")
+            locked_change = -reservation["quantity"]
+
+        reagent_after = ReagentDB.get_by_id(reservation["reagent_id"])
+        snapshot_after = json.dumps(reagent_after, ensure_ascii=False) if reagent_after else ""
+
+        ReservationDB.update_status(
+            reservation_id, "cancelled",
+            review_remarks=remarks
+        )
+
+        log_id = ReservationLogDB.create(
+            operation_type="cancel",
+            reservation_id=reservation_id,
+            reagent_id=reservation["reagent_id"],
+            reagent_name=reservation["reagent_name"],
+            batch_number=reservation["batch_number"],
+            quantity=reservation["quantity"],
+            operator_id=reservation["operator_id"],
+            operator_name=reservation.get("operator_name", ""),
+            reviewer_id=self.auth.current_user["id"],
+            reviewer_name=self.auth.current_user["display_name"],
+            status_before=reservation["status"],
+            status_after="cancelled",
+            locked_qty_change=locked_change,
+            remarks=remarks,
+            revertable=1 if reservation["status"] == "approved" else 0,
+            snapshot_before=snapshot_before,
+            snapshot_after=snapshot_after
+        )
+
+        return log_id, f"预约已取消，已释放锁定库存 {reservation['quantity']} 单位"
+
+    def complete_reservation(self, reservation_id: int,
+                             remarks: str = "") -> Tuple[int, str]:
+        self._check_permission("complete_reservation")
+
+        reservation = ReservationDB.get_by_id(reservation_id)
+        if not reservation:
+            raise OperationError("预约记录不存在")
+
+        if reservation["status"] != "approved":
+            raise OperationError(
+                f"当前状态为「{reservation['status']}」，只有已审批的预约可以领用"
+            )
+
+        reagent = ReagentDB.get_by_id(reservation["reagent_id"])
+        if not reagent:
+            raise OperationError("关联试剂不存在")
+
+        if ReagentDB.is_expired(reservation["reagent_id"]):
+            raise OperationError(
+                f"试剂已过期（过期日期：{reagent['expiration_date']}），禁止领用"
+            )
+
+        if reagent["quantity"] < reservation["quantity"]:
+            raise OperationError(
+                f"库存不足。当前库存：{reagent['quantity']}，需要：{reservation['quantity']}"
+            )
+
+        snapshot_before = json.dumps(reagent, ensure_ascii=False)
+
+        if not ReagentLockDB.update_locked_quantity(
+            reservation["reagent_id"], -reservation["quantity"]
+        ):
+            raise OperationError("领用失败，库存锁定释放错误")
+
+        if not ReagentDB.update_quantity(
+            reservation["reagent_id"], -reservation["quantity"]
+        ):
+            raise OperationError("领用失败，库存扣减错误")
+
+        reagent_after = ReagentDB.get_by_id(reservation["reagent_id"])
+        snapshot_after = json.dumps(reagent_after, ensure_ascii=False)
+
+        ReservationDB.update_status(
+            reservation_id, "completed",
+            review_remarks=remarks
+        )
+
+        log_id = ReservationLogDB.create(
+            operation_type="complete",
+            reservation_id=reservation_id,
+            reagent_id=reservation["reagent_id"],
+            reagent_name=reservation["reagent_name"],
+            batch_number=reservation["batch_number"],
+            quantity=reservation["quantity"],
+            operator_id=reservation["operator_id"],
+            operator_name=reservation.get("operator_name", ""),
+            reviewer_id=self.auth.current_user["id"],
+            reviewer_name=self.auth.current_user["display_name"],
+            status_before="approved",
+            status_after="completed",
+            locked_qty_change=-reservation["quantity"],
+            stock_qty_change=-reservation["quantity"],
+            remarks=remarks,
+            revertable=1,
+            snapshot_before=snapshot_before,
+            snapshot_after=snapshot_after
+        )
+
+        operator = UserDB.get_by_id(reservation["operator_id"])
+        operator_name = operator["display_name"] if operator else "未知"
+
+        LedgerDB.create(
+            reagent_id=reservation["reagent_id"],
+            reagent_name=reservation["reagent_name"],
+            batch_number=reservation["batch_number"],
+            operation_type="approve_use",
+            change_quantity=-reservation["quantity"],
+            balance_quantity=reagent_after["quantity"],
+            operator=operator_name,
+            reviewer=self.auth.current_user["display_name"],
+            remarks=f"预约领用 #{reservation_id}。{remarks}"
+        )
+
+        return log_id, (
+            f"领用完成：{reservation['reagent_name']} "
+            f"({reservation['batch_number']}) -{reservation['quantity']} "
+            f"{reagent['unit']}"
+        )
+
+    def release_expired_reservations(self) -> Tuple[int, List[str]]:
+        self._check_permission("release_expired_reservations")
+
+        expired = ReservationDB.get_expired_reservations()
+        released_count = 0
+        messages = []
+
+        for reservation in expired:
+            try:
+                reagent = ReagentDB.get_by_id(reservation["reagent_id"])
+                snapshot_before = json.dumps(reagent, ensure_ascii=False) if reagent else ""
+
+                if not ReagentLockDB.update_locked_quantity(
+                    reservation["reagent_id"], -reservation["quantity"]
+                ):
+                    messages.append(
+                        f"预约#{reservation['id']} 释放锁定失败，跳过"
+                    )
+                    continue
+
+                reagent_after = ReagentDB.get_by_id(reservation["reagent_id"])
+                snapshot_after = json.dumps(reagent_after, ensure_ascii=False) if reagent_after else ""
+
+                ReservationDB.update_status(
+                    reservation["id"], "expired",
+                    review_remarks=f"系统自动过期释放，原计划日期：{reservation['planned_use_date']}"
+                )
+
+                ReservationLogDB.create(
+                    operation_type="expire_release",
+                    reservation_id=reservation["id"],
+                    reagent_id=reservation["reagent_id"],
+                    reagent_name=reservation["reagent_name"],
+                    batch_number=reservation["batch_number"],
+                    quantity=reservation["quantity"],
+                    operator_id=reservation["operator_id"],
+                    operator_name=reservation.get("operator_name", ""),
+                    reviewer_id=self.auth.current_user["id"],
+                    reviewer_name=self.auth.current_user["display_name"],
+                    status_before="approved",
+                    status_after="expired",
+                    locked_qty_change=-reservation["quantity"],
+                    remarks=f"计划使用日期 {reservation['planned_use_date']} 已过期，系统自动释放锁定",
+                    revertable=0,
+                    snapshot_before=snapshot_before,
+                    snapshot_after=snapshot_after
+                )
+
+                released_count += 1
+                messages.append(
+                    f"预约#{reservation['id']} 已过期释放：{reservation['reagent_name']} "
+                    f"{reservation['quantity']} 单位"
+                )
+            except Exception as e:
+                messages.append(
+                    f"预约#{reservation['id']} 处理失败：{str(e)}"
+                )
+
+        return released_count, messages
+
+    def get_reservations(self, filters: Dict = None) -> List[Dict]:
+        self._check_permission("view_reservations")
+        return ReservationDB.get_all(filters)
+
+    def get_reservation_by_id(self, reservation_id: int) -> Optional[Dict]:
+        self._check_permission("view_reservations")
+        return ReservationDB.get_by_id(reservation_id)
+
+    def get_pending_reservations(self) -> List[Dict]:
+        self._check_permission("approve_reservation")
+        return ReservationDB.get_pending_approvals()
+
+    def get_reservation_logs(self, filters: Dict = None) -> List[Dict]:
+        self._check_permission("view_reservation_logs")
+        return ReservationLogDB.get_all(filters)
+
+    def get_reagents_with_lock_info(self, filters: Dict = None) -> List[Dict]:
+        self._check_permission("view_inventory")
+        reagents = ReagentDB.get_all(filters)
+        for r in reagents:
+            r["is_expired"] = ReagentDB.is_expired(r["id"])
+            r["is_low_stock"] = r["quantity"] <= r["low_stock_threshold"]
+            r["locked_quantity"] = r.get("locked_quantity", 0)
+            r["available_quantity"] = r["quantity"] - r["locked_quantity"]
+            r["reservation_summary"] = ReservationDB.get_reservation_summary_for_reagent(r["id"])
+        return reagents
+
+    def revert_last_reservation_operation(self) -> Tuple[int, str]:
+        self._check_permission("revert_operation")
+
+        last_log = ReservationLogDB.get_last_revertable()
+        if not last_log:
+            raise OperationError("没有可撤销的预约操作记录")
+
+        reservation = ReservationDB.get_by_id(last_log["reservation_id"])
+        if not reservation:
+            raise OperationError("关联预约记录不存在，无法撤销")
+
+        op_type = last_log["operation_type"]
+        if op_type == "approve":
+            if reservation["status"] != "approved":
+                raise OperationError(
+                    f"预约当前状态为「{reservation['status']}」，无法撤销审批"
+                )
+
+            reagent = ReagentDB.get_by_id(last_log["reagent_id"])
+            if not reagent:
+                raise OperationError("关联试剂不存在，无法撤销")
+
+            if not ReagentLockDB.update_locked_quantity(
+                last_log["reagent_id"], -last_log["quantity"]
+            ):
+                raise OperationError("撤销失败，库存锁定释放错误")
+
+            ReservationDB.update_status(
+                last_log["reservation_id"], "pending",
+                review_remarks=f"撤销审批操作 #{last_log['id']}"
+            )
+
+        elif op_type == "cancel":
+            if reservation["status"] != "cancelled":
+                raise OperationError(
+                    f"预约当前状态为「{reservation['status']}」，无法撤销取消"
+                )
+
+            reagent = ReagentDB.get_by_id(last_log["reagent_id"])
+            if not reagent:
+                raise OperationError("关联试剂不存在，无法撤销")
+
+            if not ReagentLockDB.update_locked_quantity(
+                last_log["reagent_id"], last_log["quantity"]
+            ):
+                raise OperationError("撤销失败，库存锁定恢复错误")
+
+            ReservationDB.update_status(
+                last_log["reservation_id"], "approved",
+                review_remarks=f"撤销取消操作 #{last_log['id']}"
+            )
+
+        elif op_type == "complete":
+            if reservation["status"] != "completed":
+                raise OperationError(
+                    f"预约当前状态为「{reservation['status']}」，无法撤销领用"
+                )
+
+            reagent = ReagentDB.get_by_id(last_log["reagent_id"])
+            if not reagent:
+                raise OperationError("关联试剂不存在，无法撤销")
+
+            if not ReagentLockDB.update_locked_quantity(
+                last_log["reagent_id"], last_log["quantity"]
+            ):
+                raise OperationError("撤销失败，库存锁定恢复错误")
+
+            if not ReagentDB.update_quantity(
+                last_log["reagent_id"], last_log["quantity"]
+            ):
+                raise OperationError("撤销失败，库存恢复错误")
+
+            ReservationDB.update_status(
+                last_log["reservation_id"], "approved",
+                review_remarks=f"撤销领用操作 #{last_log['id']}"
+            )
+
+            LedgerDB.create(
+                reagent_id=last_log["reagent_id"],
+                reagent_name=last_log["reagent_name"],
+                batch_number=last_log["batch_number"],
+                operation_type="stocktake",
+                change_quantity=last_log["quantity"],
+                balance_quantity=reagent["quantity"] + last_log["quantity"],
+                operator=self.auth.current_user["display_name"],
+                remarks=f"撤销预约领用 #{last_log['reservation_id']}"
+            )
+
+        else:
+            raise OperationError(f"该类型操作（{op_type}）不可撤销")
+
+        ReservationLogDB.mark_reverted(last_log["id"])
+
+        op_display = RESERVATION_OPERATION_DISPLAY.get(op_type, op_type)
+        return last_log["id"], f"已撤销预约操作 #{last_log['id']}（{op_display}）"
+
+    def get_last_revertable_reservation_log(self) -> Optional[Dict]:
+        self._check_permission("revert_operation")
+        return ReservationLogDB.get_last_revertable()

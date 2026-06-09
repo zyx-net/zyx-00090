@@ -18,6 +18,15 @@ ROLE_PERMISSIONS = {
         "export_csv": True,
         "manage_reagents": True,
         "view_ledger": True,
+        "create_reservation": True,
+        "approve_reservation": True,
+        "reject_reservation": True,
+        "reschedule_reservation": True,
+        "cancel_reservation": True,
+        "complete_reservation": True,
+        "view_reservations": True,
+        "view_reservation_logs": True,
+        "release_expired_reservations": True,
     },
     "lab_staff": {
         "view_inventory": True,
@@ -34,6 +43,15 @@ ROLE_PERMISSIONS = {
         "export_csv": True,
         "manage_reagents": False,
         "view_ledger": True,
+        "create_reservation": True,
+        "approve_reservation": False,
+        "reject_reservation": False,
+        "reschedule_reservation": False,
+        "cancel_reservation": True,
+        "complete_reservation": False,
+        "view_reservations": True,
+        "view_reservation_logs": True,
+        "release_expired_reservations": False,
     },
     "auditor": {
         "view_inventory": True,
@@ -50,6 +68,15 @@ ROLE_PERMISSIONS = {
         "export_csv": True,
         "manage_reagents": False,
         "view_ledger": True,
+        "create_reservation": False,
+        "approve_reservation": True,
+        "reject_reservation": True,
+        "reschedule_reservation": True,
+        "cancel_reservation": True,
+        "complete_reservation": True,
+        "view_reservations": True,
+        "view_reservation_logs": True,
+        "release_expired_reservations": True,
     }
 }
 
@@ -68,6 +95,27 @@ OPERATION_TYPE_DISPLAY = {
     "scrap": "报废",
     "stocktake": "盘点调整",
     "import": "CSV导入"
+}
+
+RESERVATION_OPERATION_DISPLAY = {
+    "create": "创建预约",
+    "approve": "审批通过",
+    "reject": "拒绝预约",
+    "cancel": "取消预约",
+    "complete": "实际领用",
+    "expire_release": "过期释放",
+    "reschedule": "改期",
+    "revert": "撤销操作"
+}
+
+RESERVATION_STATUS_DISPLAY = {
+    "pending": "待审核",
+    "approved": "已审批",
+    "rejected": "已拒绝",
+    "cancelled": "已取消",
+    "completed": "已领用",
+    "expired": "已过期",
+    "rescheduled": "已改期"
 }
 
 STATUS_DISPLAY = {

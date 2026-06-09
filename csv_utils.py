@@ -3,7 +3,8 @@ import json
 from typing import List, Dict, Tuple
 from datetime import datetime
 
-from database import ReagentDB, OperationDB, LedgerDB
+from database import (ReagentDB, OperationDB, LedgerDB,
+                      ReservationDB, ReagentLockDB)
 from auth import AuthManager, OPERATION_TYPE_DISPLAY, STATUS_DISPLAY
 
 
@@ -18,26 +19,36 @@ class CSVManager:
     def export_reagents(self, filepath: str, filters: Dict = None) -> Tuple[int, str]:
         self._check_permission("export_csv")
 
+        from database import ReservationDB
+
         reagents = ReagentDB.get_all(filters)
 
-        headers = ["ID", "试剂名称", "批号", "数量", "单位", "过期日期", "低库存阈值",
-                  "规格", "生产厂商", "储存条件", "备注", "创建时间", "更新时间"]
+        headers = ["ID", "试剂名称", "批号", "总库存", "已锁定量", "可用量",
+                  "单位", "过期日期", "低库存阈值", "规格", "生产厂商",
+                  "储存条件", "预约摘要", "备注", "创建时间", "更新时间"]
 
         with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             writer.writerow(headers)
             for r in reagents:
+                locked = r.get("locked_quantity", 0)
+                available = r["quantity"] - locked
+                reservation_summary = ReservationDB.get_reservation_summary_for_reagent(r["id"])
+
                 writer.writerow([
                     r["id"],
                     r["name"],
                     r["batch_number"],
                     r["quantity"],
+                    locked,
+                    available,
                     r["unit"],
                     r["expiration_date"] if r["expiration_date"] else "",
                     r["low_stock_threshold"],
                     r["specification"],
                     r["manufacturer"],
                     r["storage_condition"],
+                    reservation_summary,
                     r["remarks"],
                     r["created_at"],
                     r["updated_at"]
@@ -74,12 +85,13 @@ class CSVManager:
 
         return len(ledger), f"成功导出 {len(ledger)} 条台账记录到 {filepath}"
 
-    def import_reagents(self, filepath: str) -> Tuple[int, int, List[str]]:
+    def import_reagents(self, filepath: str) -> Tuple[int, int, List[str], List[str]]:
         self._check_permission("import_csv")
 
         success_count = 0
         skip_count = 0
         errors = []
+        warnings = []
 
         with open(filepath, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
@@ -88,6 +100,10 @@ class CSVManager:
             for field in required_fields:
                 if field not in reader.fieldnames:
                     raise ValueError(f"CSV 文件缺少必要列：{field}")
+
+            pending_reservations = ReservationDB.get_all({"status": "pending"})
+            approved_reservations = ReservationDB.get_all({"status": "approved"})
+            all_active_reservations = pending_reservations + approved_reservations
 
             for row_num, row in enumerate(reader, start=2):
                 try:
@@ -132,6 +148,38 @@ class CSVManager:
                         low_stock_threshold = int(row.get("低库存阈值", "10"))
                     except ValueError:
                         low_stock_threshold = 10
+
+                    conflict_reservations = []
+                    for res in all_active_reservations:
+                        if res["reagent_name"] == name:
+                            conflict_reservations.append(res)
+
+                    if conflict_reservations:
+                        total_reserved = sum(r["quantity"] for r in conflict_reservations)
+                        same_batch_count = sum(
+                            1 for r in conflict_reservations
+                            if r["batch_number"] == batch_number
+                        )
+                        conflict_details = []
+                        for r in conflict_reservations[:3]:
+                            status = "待审核" if r["status"] == "pending" else "已审批"
+                            batch_info = f"[{r['batch_number']}" if r["batch_number"] != batch_number else ""
+                            conflict_details.append(
+                                f"#{r['id']}({r.get('operator_name','')}预约{r['quantity']}{unit},{status}{batch_info})"
+                            )
+                        if len(conflict_reservations) > 3:
+                            conflict_details.append(f"...共{len(conflict_reservations)}个")
+
+                        batch_note = ""
+                        if same_batch_count > 0:
+                            batch_note = f"（其中{same_batch_count}个为同批号）"
+
+                        warnings.append(
+                            f"第 {row_num} 行：{name} ({batch_number}) 存在未完成预约冲突："
+                            f"导入数量 {quantity}{unit}，该试剂已预约 {total_reserved}{unit}{batch_note}。"
+                            f"冲突预约：{';'.join(conflict_details)}。"
+                            f"导入后可用库存可能不足，请谨慎处理。"
+                        )
 
                     reagent_before = None
                     reagent_id = ReagentDB.create(
@@ -179,7 +227,7 @@ class CSVManager:
                     skip_count += 1
                     continue
 
-        return success_count, skip_count, errors
+        return success_count, skip_count, errors, warnings
 
     def create_sample_import(self, filepath: str) -> str:
         sample_data = [

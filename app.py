@@ -5,7 +5,9 @@ import os
 import sys
 
 from database import init_database, DB_PATH
-from auth import AuthManager, ROLE_DISPLAY, OPERATION_TYPE_DISPLAY, STATUS_DISPLAY
+from auth import (AuthManager, ROLE_DISPLAY, OPERATION_TYPE_DISPLAY,
+                  STATUS_DISPLAY, RESERVATION_OPERATION_DISPLAY,
+                  RESERVATION_STATUS_DISPLAY)
 from business import ReagentManager, OperationError
 from csv_utils import CSVManager
 
@@ -26,6 +28,8 @@ class ReagentManagementApp:
         self.current_tab = None
         self.selected_reagent_id = None
         self.selected_approval_id = None
+        self.selected_reservation_id = None
+        self.selected_reservation_log_id = None
 
         self.setup_styles()
         self.show_login_dialog()
@@ -111,23 +115,29 @@ class ReagentManagementApp:
         self.notebook.pack(fill='both', expand=True)
 
         self.tab_inventory = ttk.Frame(self.notebook)
+        self.tab_reservation = ttk.Frame(self.notebook)
         self.tab_approval = ttk.Frame(self.notebook)
         self.tab_operations = ttk.Frame(self.notebook)
         self.tab_history = ttk.Frame(self.notebook)
+        self.tab_reservation_logs = ttk.Frame(self.notebook)
         self.tab_ledger = ttk.Frame(self.notebook)
         self.tab_import_export = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_inventory, text='库存管理')
-        self.notebook.add(self.tab_approval, text='领用审核')
+        self.notebook.add(self.tab_reservation, text='预约管理')
+        self.notebook.add(self.tab_approval, text='预约审核')
         self.notebook.add(self.tab_operations, text='业务操作')
         self.notebook.add(self.tab_history, text='操作历史')
+        self.notebook.add(self.tab_reservation_logs, text='预约日志')
         self.notebook.add(self.tab_ledger, text='库存台账')
         self.notebook.add(self.tab_import_export, text='导入导出')
 
         self.setup_inventory_tab()
+        self.setup_reservation_tab()
         self.setup_approval_tab()
         self.setup_operations_tab()
         self.setup_history_tab()
+        self.setup_reservation_logs_tab()
         self.setup_ledger_tab()
         self.setup_import_export_tab()
 
@@ -157,10 +167,14 @@ class ReagentManagementApp:
 
         if tab_text == '库存管理':
             self.refresh_inventory()
-        elif tab_text == '领用审核':
-            self.refresh_approvals()
+        elif tab_text == '预约管理':
+            self.refresh_reservations()
+        elif tab_text == '预约审核':
+            self.refresh_reservation_approvals()
         elif tab_text == '操作历史':
             self.refresh_history()
+        elif tab_text == '预约日志':
+            self.refresh_reservation_logs()
         elif tab_text == '库存台账':
             self.refresh_ledger()
 
@@ -200,6 +214,8 @@ class ReagentManagementApp:
             ttk.Button(btn_frame, text="入库", command=self.stock_in_dialog).pack(side='left', padx=5)
         if self.auth.has_permission("apply_use"):
             ttk.Button(btn_frame, text="申请领用", command=self.apply_use_dialog).pack(side='left', padx=5)
+        if self.auth.has_permission("create_reservation"):
+            ttk.Button(btn_frame, text="预约领用", command=self.create_reservation_dialog).pack(side='left', padx=5)
         if self.auth.has_permission("return_reagent"):
             ttk.Button(btn_frame, text="归还", command=self.return_dialog).pack(side='left', padx=5)
         if self.auth.has_permission("scrap"):
@@ -210,23 +226,27 @@ class ReagentManagementApp:
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
 
-        columns = ("id", "name", "batch", "quantity", "unit", "expiration", "threshold",
-                  "spec", "manufacturer", "storage", "is_expired", "is_low")
+        columns = ("id", "name", "batch", "quantity", "locked", "available", "unit", "expiration",
+                  "threshold", "spec", "manufacturer", "storage", "reservation",
+                  "is_expired", "is_low")
         self.inventory_tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
 
         headings = [
             ("id", "ID", 50),
-            ("name", "试剂名称", 150),
-            ("batch", "批号", 120),
-            ("quantity", "数量", 80),
-            ("unit", "单位", 60),
-            ("expiration", "过期日期", 100),
-            ("threshold", "低库存阈值", 90),
-            ("spec", "规格", 100),
-            ("manufacturer", "生产厂商", 120),
-            ("storage", "储存条件", 100),
-            ("is_expired", "过期状态", 80),
-            ("is_low", "库存状态", 80)
+            ("name", "试剂名称", 130),
+            ("batch", "批号", 110),
+            ("quantity", "总库存", 70),
+            ("locked", "已锁定", 70),
+            ("available", "可用量", 70),
+            ("unit", "单位", 50),
+            ("expiration", "过期日期", 90),
+            ("threshold", "低库存阈值", 80),
+            ("spec", "规格", 90),
+            ("manufacturer", "生产厂商", 110),
+            ("storage", "储存条件", 90),
+            ("reservation", "预约摘要", 180),
+            ("is_expired", "过期状态", 70),
+            ("is_low", "库存状态", 70)
         ]
 
         for col, text, width in headings:
@@ -274,13 +294,16 @@ class ReagentManagementApp:
 
         try:
             filters = self.get_inventory_filters()
-            reagents = self.manager.get_reagents(filters)
+            reagents = self.manager.get_reagents_with_lock_info(filters)
 
             for r in reagents:
                 expired_status = "已过期" if r["is_expired"] else "正常"
                 stock_status = "低库存" if r["is_low_stock"] else "正常"
 
                 exp_date = r["expiration_date"] if r["expiration_date"] else "无"
+                locked = r.get("locked_quantity", 0)
+                available = r.get("available_quantity", r["quantity"])
+                reservation_summary = r.get("reservation_summary", "") or "-"
 
                 tags = ()
                 if r["is_expired"]:
@@ -290,9 +313,10 @@ class ReagentManagementApp:
 
                 self.inventory_tree.insert('', 'end', iid=str(r["id"]), values=(
                     r["id"], r["name"], r["batch_number"], r["quantity"],
-                    r["unit"], exp_date, r["low_stock_threshold"],
+                    locked, available, r["unit"], exp_date, r["low_stock_threshold"],
                     r["specification"] or "-", r["manufacturer"] or "-",
-                    r["storage_condition"] or "-", expired_status, stock_status
+                    r["storage_condition"] or "-", reservation_summary,
+                    expired_status, stock_status
                 ), tags=tags)
 
             self.inventory_tree.tag_configure('expired', background='#ffcccc')
@@ -561,6 +585,78 @@ class ReagentManagementApp:
         ttk.Button(btn_frame, text="提交申请", command=do_apply, width=12).pack(side='left', padx=10)
         ttk.Button(btn_frame, text="取 消", command=dialog.destroy, width=12).pack(side='left', padx=10)
 
+    def create_reservation_dialog(self):
+        reagent = self.get_selected_reagent()
+        if not reagent:
+            return
+
+        from database import ReagentDB, ReagentLockDB
+        if ReagentDB.is_expired(reagent["id"]):
+            messagebox.showerror("错误", f"试剂已过期（过期日期：{reagent['expiration_date']}），禁止预约")
+            return
+
+        available = ReagentLockDB.get_available_quantity(reagent["id"])
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("预约领用")
+        dialog.geometry("450x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text=f"试剂：{reagent['name']} ({reagent['batch_number']})",
+                  font=('Microsoft YaHei', 10, 'bold')).grid(row=0, column=0, columnspan=2, pady=10)
+        ttk.Label(frame, text=f"总库存：{reagent['quantity']} {reagent['unit']}").grid(row=1, column=0, columnspan=2, pady=2)
+        ttk.Label(frame, text=f"已锁定：{reagent.get('locked_quantity', 0)} {reagent['unit']}",
+                  foreground='#FF9800').grid(row=2, column=0, columnspan=2, pady=2)
+        ttk.Label(frame, text=f"可用量：{available} {reagent['unit']}",
+                  foreground='#4CAF50', font=('Microsoft YaHei', 10, 'bold')).grid(row=3, column=0, columnspan=2, pady=5)
+
+        ttk.Label(frame, text="预约数量：").grid(row=4, column=0, sticky='e', padx=5, pady=15)
+        qty_entry = ttk.Entry(frame, width=20)
+        qty_entry.grid(row=4, column=1, padx=5, pady=15)
+        qty_entry.focus()
+
+        ttk.Label(frame, text="计划使用日期：").grid(row=5, column=0, sticky='e', padx=5, pady=5)
+        from datetime import datetime, timedelta
+        default_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        date_entry = ttk.Entry(frame, width=20)
+        date_entry.insert(0, default_date)
+        date_entry.grid(row=5, column=1, padx=5, pady=5)
+        ttk.Label(frame, text="(格式：YYYY-MM-DD)", foreground='gray').grid(row=6, column=1, sticky='w', padx=5)
+
+        ttk.Label(frame, text="用途：").grid(row=7, column=0, sticky='e', padx=5, pady=5)
+        remarks_entry = ttk.Entry(frame, width=30)
+        remarks_entry.grid(row=7, column=1, padx=5, pady=5)
+
+        def do_create():
+            try:
+                qty_str = qty_entry.get().strip()
+                if not qty_str:
+                    messagebox.showwarning("提示", "请输入预约数量")
+                    return
+                quantity = int(qty_str)
+                planned_date = date_entry.get().strip()
+                remarks = remarks_entry.get().strip()
+
+                _, msg = self.manager.create_reservation(
+                    reagent["id"], quantity, planned_date, remarks
+                )
+                messagebox.showinfo("成功", msg)
+                self.refresh_inventory()
+                dialog.destroy()
+            except ValueError:
+                messagebox.showerror("错误", "数量必须是整数")
+            except OperationError as e:
+                messagebox.showerror("错误", str(e))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=8, column=0, columnspan=2, pady=20)
+        ttk.Button(btn_frame, text="提交预约", command=do_create, width=12).pack(side='left', padx=10)
+        ttk.Button(btn_frame, text="取 消", command=dialog.destroy, width=12).pack(side='left', padx=10)
+
     def return_dialog(self):
         reagent = self.get_selected_reagent()
         if not reagent:
@@ -740,51 +836,475 @@ class ReagentManagementApp:
         ttk.Button(btn_frame, text="确认调整", command=do_stocktake, width=12).pack(side='left', padx=10)
         ttk.Button(btn_frame, text="取 消", command=dialog.destroy, width=12).pack(side='left', padx=10)
 
+    def setup_reservation_tab(self):
+        frame = self.tab_reservation
+
+        if not self.auth.has_permission("view_reservations"):
+            ttk.Label(frame, text="当前角色无预约查看权限", font=('Microsoft YaHei', 14), foreground='gray').pack(pady=50)
+            return
+
+        filter_frame = ttk.LabelFrame(frame, text="筛选条件", padding=10)
+        filter_frame.pack(fill='x', pady=10, padx=10)
+
+        ttk.Label(filter_frame, text="试剂名称：").grid(row=0, column=0, padx=5, pady=5)
+        self.res_filter_name = ttk.Entry(filter_frame, width=15)
+        self.res_filter_name.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(filter_frame, text="批号：").grid(row=0, column=2, padx=5, pady=5)
+        self.res_filter_batch = ttk.Entry(filter_frame, width=15)
+        self.res_filter_batch.grid(row=0, column=3, padx=5, pady=5)
+
+        ttk.Label(filter_frame, text="状态：").grid(row=0, column=4, padx=5, pady=5)
+        res_statuses = ["全部", "待审核", "已审批", "已拒绝", "已取消", "已领用", "已过期", "已改期"]
+        self.res_filter_status = ttk.Combobox(filter_frame, values=res_statuses, state='readonly', width=10)
+        self.res_filter_status.grid(row=0, column=5, padx=5, pady=5)
+        self.res_filter_status.current(0)
+
+        ttk.Label(filter_frame, text="计划日期从：").grid(row=1, column=0, padx=5, pady=5)
+        self.res_filter_date_start = ttk.Entry(filter_frame, width=15)
+        self.res_filter_date_start.grid(row=1, column=1, padx=5, pady=5)
+
+        ttk.Label(filter_frame, text="到：").grid(row=1, column=2, padx=5, pady=5)
+        self.res_filter_date_end = ttk.Entry(filter_frame, width=15)
+        self.res_filter_date_end.grid(row=1, column=3, padx=5, pady=5)
+
+        ttk.Button(filter_frame, text="查询", command=self.refresh_reservations).grid(row=0, column=6, padx=10, pady=5, rowspan=2)
+        ttk.Button(filter_frame, text="重置", command=self.reset_reservation_filters).grid(row=0, column=7, padx=5, pady=5, rowspan=2)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill='x', padx=10, pady=5)
+
+        if self.auth.has_permission("create_reservation"):
+            ttk.Button(btn_frame, text="新建预约", command=self.create_reservation_dialog).pack(side='left', padx=5)
+        if self.auth.has_permission("cancel_reservation"):
+            ttk.Button(btn_frame, text="取消预约", command=self.cancel_selected_reservation).pack(side='left', padx=5)
+        if self.auth.has_permission("complete_reservation"):
+            ttk.Button(btn_frame, text="确认领用", command=self.complete_selected_reservation).pack(side='left', padx=5)
+        if self.auth.has_permission("reschedule_reservation"):
+            ttk.Button(btn_frame, text="改期", command=self.reschedule_selected_reservation).pack(side='left', padx=5)
+        if self.auth.has_permission("release_expired_reservations"):
+            ttk.Button(btn_frame, text="释放过期预约", command=self.release_expired_reservations).pack(side='left', padx=5)
+
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        columns = ("id", "reagent", "batch", "qty", "unit", "planned_date", "status",
+                  "operator", "reviewer", "created_at", "remarks")
+        self.reservation_tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
+
+        headings = [
+            ("id", "预约ID", 70),
+            ("reagent", "试剂名称", 130),
+            ("batch", "批号", 110),
+            ("qty", "数量", 70),
+            ("unit", "单位", 50),
+            ("planned_date", "计划使用日期", 100),
+            ("status", "状态", 80),
+            ("operator", "申请人", 90),
+            ("reviewer", "审核人", 90),
+            ("created_at", "创建时间", 140),
+            ("remarks", "备注", 180)
+        ]
+
+        for col, text, width in headings:
+            self.reservation_tree.heading(col, text=text)
+            self.reservation_tree.column(col, width=width, anchor='center')
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient='vertical', command=self.reservation_tree.yview)
+        self.reservation_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.reservation_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        self.reservation_tree.bind('<<TreeviewSelect>>', self.on_reservation_select)
+        self.reservation_tree.bind('<Double-1>', self.show_reservation_detail)
+
+        self.refresh_reservations()
+
+    def reset_reservation_filters(self):
+        self.res_filter_name.delete(0, 'end')
+        self.res_filter_batch.delete(0, 'end')
+        self.res_filter_status.current(0)
+        self.res_filter_date_start.delete(0, 'end')
+        self.res_filter_date_end.delete(0, 'end')
+        self.refresh_reservations()
+
+    def get_reservation_filters(self):
+        filters = {}
+        name = self.res_filter_name.get().strip()
+        if name:
+            filters["reagent_name"] = name
+        batch = self.res_filter_batch.get().strip()
+        if batch:
+            filters["batch_number"] = batch
+
+        status_map = {
+            "待审核": "pending",
+            "已审批": "approved",
+            "已拒绝": "rejected",
+            "已取消": "cancelled",
+            "已领用": "completed",
+            "已过期": "expired",
+            "已改期": "rescheduled"
+        }
+        status_val = self.res_filter_status.get()
+        if status_val in status_map:
+            filters["status"] = status_map[status_val]
+
+        date_start = self.res_filter_date_start.get().strip()
+        if date_start:
+            filters["planned_start_date"] = date_start
+        date_end = self.res_filter_date_end.get().strip()
+        if date_end:
+            filters["planned_end_date"] = date_end
+
+        return filters
+
+    def refresh_reservations(self):
+        for item in self.reservation_tree.get_children():
+            self.reservation_tree.delete(item)
+
+        try:
+            filters = self.get_reservation_filters()
+            reservations = self.manager.get_reservations(filters)
+
+            for r in reservations:
+                status_display = RESERVATION_STATUS_DISPLAY.get(r["status"], r["status"])
+
+                tags = ()
+                if r["status"] == "approved":
+                    tags = ('approved',)
+                elif r["status"] == "rejected":
+                    tags = ('rejected',)
+                elif r["status"] == "cancelled":
+                    tags = ('cancelled',)
+                elif r["status"] == "completed":
+                    tags = ('completed',)
+                elif r["status"] == "expired":
+                    tags = ('expired',)
+                elif r["status"] == "pending":
+                    tags = ('pending',)
+
+                self.reservation_tree.insert('', 'end', iid=str(r["id"]), values=(
+                    r["id"], r["reagent_name"], r["batch_number"], r["quantity"],
+                    r.get("unit", ""), r["planned_use_date"], status_display,
+                    r.get("operator_name", ""), r.get("reviewer_name", "") or "-",
+                    r["created_at"], r.get("remarks", "") or ""
+                ), tags=tags)
+
+            self.reservation_tree.tag_configure('pending', background='#fff3cd')
+            self.reservation_tree.tag_configure('approved', background='#d4edda')
+            self.reservation_tree.tag_configure('rejected', background='#f8d7da')
+            self.reservation_tree.tag_configure('cancelled', background='#e2e3e5')
+            self.reservation_tree.tag_configure('completed', background='#d1ecf1')
+            self.reservation_tree.tag_configure('expired', background='#f5c6cb')
+
+            self.set_status(f"查询到 {len(reservations)} 条预约记录")
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def on_reservation_select(self, event):
+        selection = self.reservation_tree.selection()
+        if selection:
+            self.selected_reservation_id = int(selection[0])
+
+    def show_reservation_detail(self, event):
+        selection = self.reservation_tree.selection()
+        if not selection:
+            return
+
+        reservation = self.manager.get_reservation_by_id(int(selection[0]))
+        if not reservation:
+            return
+
+        detail_window = tk.Toplevel(self.root)
+        detail_window.title(f"预约详情 - #{reservation['id']}")
+        detail_window.geometry("550x550")
+        detail_window.transient(self.root)
+
+        frame = ttk.Frame(detail_window, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        status_display = RESERVATION_STATUS_DISPLAY.get(reservation["status"], reservation["status"])
+
+        info = [
+            ("预约ID", f"#{reservation['id']}"),
+            ("试剂名称", reservation["reagent_name"]),
+            ("批号", reservation["batch_number"]),
+            ("预约数量", f"{reservation['quantity']} {reservation.get('unit', '')}"),
+            ("当前总库存", f"{reservation.get('current_stock', 0)} {reservation.get('unit', '')}"),
+            ("已锁定库存", f"{reservation.get('current_locked', 0)} {reservation.get('unit', '')}"),
+            ("计划使用日期", reservation["planned_use_date"]),
+            ("原计划日期", reservation.get("original_planned_date", "-") or "-"),
+            ("状态", status_display),
+            ("申请人", reservation.get("operator_name", "-") or "-"),
+            ("审核人", reservation.get("reviewer_name", "-") or "-"),
+            ("申请备注", reservation.get("remarks", "-") or "-"),
+            ("审核备注", reservation.get("review_remarks", "-") or "-"),
+            ("创建时间", reservation["created_at"]),
+            ("更新时间", reservation["updated_at"])
+        ]
+
+        for i, (label, value) in enumerate(info):
+            ttk.Label(frame, text=f"{label}：", font=('Microsoft YaHei', 10, 'bold')).grid(row=i, column=0, sticky='e', padx=5, pady=5)
+            ttk.Label(frame, text=value, font=('Microsoft YaHei', 10)).grid(row=i, column=1, sticky='w', padx=5, pady=5)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=len(info), column=0, columnspan=2, pady=15)
+
+        if reservation["status"] == "approved" and self.auth.has_permission("complete_reservation"):
+            ttk.Button(btn_frame, text="确认领用",
+                      command=lambda: (detail_window.destroy(), self.complete_selected_reservation())
+                      ).pack(side='left', padx=5)
+        if reservation["status"] in ["pending", "approved"] and self.auth.has_permission("cancel_reservation"):
+            ttk.Button(btn_frame, text="取消预约",
+                      command=lambda: (detail_window.destroy(), self.cancel_selected_reservation())
+                      ).pack(side='left', padx=5)
+        if reservation["status"] in ["pending", "approved"] and self.auth.has_permission("reschedule_reservation"):
+            ttk.Button(btn_frame, text="改期",
+                      command=lambda: (detail_window.destroy(), self.reschedule_selected_reservation())
+                      ).pack(side='left', padx=5)
+
+    def cancel_selected_reservation(self):
+        if not self.selected_reservation_id:
+            messagebox.showwarning("提示", "请先选择要取消的预约")
+            return
+
+        remarks = simpledialog.askstring("取消原因", "请输入取消原因（可选）：", parent=self.root)
+        if remarks is None:
+            return
+
+        try:
+            _, msg = self.manager.cancel_reservation(
+                self.selected_reservation_id, remarks or ""
+            )
+            messagebox.showinfo("成功", msg)
+            self.selected_reservation_id = None
+            self.refresh_reservations()
+            self.refresh_inventory()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def complete_selected_reservation(self):
+        if not self.selected_reservation_id:
+            messagebox.showwarning("提示", "请先选择要领用的预约")
+            return
+
+        reservation = self.manager.get_reservation_by_id(self.selected_reservation_id)
+        if not reservation:
+            return
+
+        if not messagebox.askyesno("确认",
+            f"确认领用 {reservation['quantity']} {reservation.get('unit', '')} "
+            f"{reservation['reagent_name']} ({reservation['batch_number']})？\n"
+            f"此操作将扣减库存。"):
+            return
+
+        remarks = simpledialog.askstring("领用备注", "请输入领用备注（可选）：", parent=self.root)
+        if remarks is None:
+            return
+
+        try:
+            _, msg = self.manager.complete_reservation(
+                self.selected_reservation_id, remarks or ""
+            )
+            messagebox.showinfo("成功", msg)
+            self.selected_reservation_id = None
+            self.refresh_reservations()
+            self.refresh_inventory()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def reschedule_selected_reservation(self):
+        if not self.selected_reservation_id:
+            messagebox.showwarning("提示", "请先选择要改期的预约")
+            return
+
+        reservation = self.manager.get_reservation_by_id(self.selected_reservation_id)
+        if not reservation:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("预约改期")
+        dialog.geometry("400x250")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text=f"预约：{reservation['reagent_name']} ({reservation['batch_number']})",
+                  font=('Microsoft YaHei', 10, 'bold')).grid(row=0, column=0, columnspan=2, pady=10)
+        ttk.Label(frame, text=f"原计划日期：{reservation['planned_use_date']}").grid(row=1, column=0, columnspan=2, pady=5)
+
+        ttk.Label(frame, text="新计划日期：").grid(row=2, column=0, sticky='e', padx=5, pady=15)
+        from datetime import datetime, timedelta
+        default_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        date_entry = ttk.Entry(frame, width=20)
+        date_entry.insert(0, default_date)
+        date_entry.grid(row=2, column=1, padx=5, pady=15)
+
+        ttk.Label(frame, text="改期原因：").grid(row=3, column=0, sticky='e', padx=5, pady=5)
+        remarks_entry = ttk.Entry(frame, width=30)
+        remarks_entry.grid(row=3, column=1, padx=5, pady=5)
+
+        def do_reschedule():
+            try:
+                new_date = date_entry.get().strip()
+                remarks = remarks_entry.get().strip()
+                _, msg = self.manager.reschedule_reservation(
+                    self.selected_reservation_id, new_date, remarks
+                )
+                messagebox.showinfo("成功", msg)
+                self.selected_reservation_id = None
+                self.refresh_reservations()
+                self.refresh_inventory()
+                dialog.destroy()
+            except OperationError as e:
+                messagebox.showerror("错误", str(e))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=15)
+        ttk.Button(btn_frame, text="确 定", command=do_reschedule, width=12).pack(side='left', padx=10)
+        ttk.Button(btn_frame, text="取 消", command=dialog.destroy, width=12).pack(side='left', padx=10)
+
+    def release_expired_reservations(self):
+        if not messagebox.askyesno("确认", "确定要释放所有过期的预约吗？"):
+            return
+
+        try:
+            count, messages = self.manager.release_expired_reservations()
+            if count > 0:
+                msg = f"已释放 {count} 个过期预约：\n" + "\n".join(messages[:10])
+                if len(messages) > 10:
+                    msg += f"\n... 共 {len(messages)} 条处理结果"
+                messagebox.showinfo("完成", msg)
+            else:
+                messagebox.showinfo("完成", "没有过期的预约需要释放")
+            self.refresh_reservations()
+            self.refresh_inventory()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
     def setup_approval_tab(self):
         frame = self.tab_approval
 
-        if not self.auth.has_permission("approve_use"):
-            ttk.Label(frame, text="当前角色无领用审核权限", font=('Microsoft YaHei', 14), foreground='gray').pack(pady=50)
+        if not self.auth.has_permission("approve_reservation"):
+            ttk.Label(frame, text="当前角色无预约审核权限", font=('Microsoft YaHei', 14), foreground='gray').pack(pady=50)
             return
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill='x', padx=10, pady=10)
 
-        ttk.Button(btn_frame, text="刷新", command=self.refresh_approvals).pack(side='left', padx=5)
-        ttk.Button(btn_frame, text="批准", command=self.approve_selected).pack(side='left', padx=5)
-        ttk.Button(btn_frame, text="拒绝", command=self.reject_selected).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="刷新", command=self.refresh_reservation_approvals).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="批准", command=self.approve_selected_reservation).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="拒绝", command=self.reject_selected_reservation).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="改期", command=self.reschedule_selected_reservation).pack(side='left', padx=5)
 
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
 
-        columns = ("id", "reagent", "batch", "apply_qty", "current_qty", "unit", "operator", "time", "remarks")
-        self.approval_tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
+        columns = ("id", "reagent", "batch", "apply_qty", "available_qty", "unit",
+                  "planned_date", "operator", "time", "remarks")
+        self.res_approval_tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
 
         headings = [
-            ("id", "申请ID", 70),
+            ("id", "预约ID", 70),
             ("reagent", "试剂名称", 150),
             ("batch", "批号", 120),
-            ("apply_qty", "申请数量", 80),
-            ("current_qty", "当前库存", 80),
+            ("apply_qty", "预约数量", 80),
+            ("available_qty", "可用库存", 80),
             ("unit", "单位", 60),
+            ("planned_date", "计划使用日期", 100),
             ("operator", "申请人", 100),
             ("time", "申请时间", 150),
-            ("remarks", "备注", 200)
+            ("remarks", "备注", 150)
         ]
 
         for col, text, width in headings:
-            self.approval_tree.heading(col, text=text)
-            self.approval_tree.column(col, width=width, anchor='center')
+            self.res_approval_tree.heading(col, text=text)
+            self.res_approval_tree.column(col, width=width, anchor='center')
 
-        scrollbar = ttk.Scrollbar(tree_frame, orient='vertical', command=self.approval_tree.yview)
-        self.approval_tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar = ttk.Scrollbar(tree_frame, orient='vertical', command=self.res_approval_tree.yview)
+        self.res_approval_tree.configure(yscrollcommand=scrollbar.set)
 
-        self.approval_tree.pack(side='left', fill='both', expand=True)
+        self.res_approval_tree.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
 
-        self.approval_tree.bind('<<TreeviewSelect>>', self.on_approval_select)
+        self.res_approval_tree.bind('<<TreeviewSelect>>', self.on_reservation_approval_select)
 
-        self.refresh_approvals()
+        self.refresh_reservation_approvals()
+
+    def on_reservation_approval_select(self, event):
+        selection = self.res_approval_tree.selection()
+        if selection:
+            self.selected_reservation_id = int(selection[0])
+
+    def refresh_reservation_approvals(self):
+        if not self.auth.has_permission("approve_reservation"):
+            return
+
+        for item in self.res_approval_tree.get_children():
+            self.res_approval_tree.delete(item)
+
+        try:
+            from database import ReagentLockDB
+            approvals = self.manager.get_pending_reservations()
+            for a in approvals:
+                available = ReagentLockDB.get_available_quantity(a["reagent_id"])
+                self.res_approval_tree.insert('', 'end', iid=str(a["id"]), values=(
+                    a["id"], a["reagent_name"], a["batch_number"],
+                    a["quantity"], available, a.get("unit", ""),
+                    a["planned_use_date"], a.get("operator_name", ""),
+                    a["created_at"], a.get("remarks", "") or ""
+                ))
+            self.set_status(f"待审核预约：{len(approvals)} 条")
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def approve_selected_reservation(self):
+        if not self.selected_reservation_id:
+            messagebox.showwarning("提示", "请先选择要审核的预约")
+            return
+
+        remarks = simpledialog.askstring("审核备注", "请输入审核备注（可选）：", parent=self.root)
+        if remarks is None:
+            return
+
+        try:
+            _, msg = self.manager.approve_reservation(
+                self.selected_reservation_id, remarks or ""
+            )
+            messagebox.showinfo("成功", msg)
+            self.selected_reservation_id = None
+            self.refresh_reservation_approvals()
+            self.refresh_reservations()
+            self.refresh_inventory()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def reject_selected_reservation(self):
+        if not self.selected_reservation_id:
+            messagebox.showwarning("提示", "请先选择要拒绝的预约")
+            return
+
+        remarks = simpledialog.askstring("拒绝原因", "请输入拒绝原因：", parent=self.root)
+        if remarks is None:
+            return
+        if not remarks or not remarks.strip():
+            messagebox.showwarning("提示", "请输入拒绝原因")
+            return
+
+        try:
+            _, msg = self.manager.reject_reservation(
+                self.selected_reservation_id, remarks.strip()
+            )
+            messagebox.showinfo("成功", msg)
+            self.selected_reservation_id = None
+            self.refresh_reservation_approvals()
+            self.refresh_reservations()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
 
     def on_approval_select(self, event):
         selection = self.approval_tree.selection()
@@ -883,7 +1403,8 @@ class ReagentManagementApp:
             revert_frame = ttk.LabelFrame(main_frame, text="撤销操作", padding=15)
             revert_frame.pack(fill='x')
 
-            ttk.Label(revert_frame, text="此操作将撤销最近一次可撤销的合规动作（入库、审核领用、归还、报废、盘点）",
+            ttk.Label(revert_frame,
+                      text="此操作将撤销最近一次可撤销的合规动作（入库、审核领用、归还、报废、盘点、预约审批、取消预约、实际领用）",
                       wraplength=800).pack(pady=5)
 
             self.last_op_var = tk.StringVar(value="检查中...")
@@ -892,25 +1413,72 @@ class ReagentManagementApp:
             def check_revertable():
                 try:
                     from database import OperationDB
-                    last = OperationDB.get_last_revertable()
+                    last_op = OperationDB.get_last_revertable()
+                    last_res_log = self.manager.get_last_revertable_reservation_log()
+
+                    last = None
+                    is_reservation = False
+
+                    if last_op and last_res_log:
+                        op_time = last_op.get("operation_time", "")
+                        log_time = last_res_log.get("operation_time", "")
+                        if log_time >= op_time:
+                            last = last_res_log
+                            is_reservation = True
+                        else:
+                            last = last_op
+                    elif last_res_log:
+                        last = last_res_log
+                        is_reservation = True
+                    elif last_op:
+                        last = last_op
+
                     if last:
-                        op_type = OPERATION_TYPE_DISPLAY.get(last["operation_type"], last["operation_type"])
-                        reagent = last.get("reagent_name", "")
-                        batch = last.get("batch_number", "")
-                        self.last_op_var.set(f"最近可撤销操作：#{last['id']} - {op_type} - {reagent} ({batch}) 数量：{last['quantity']}")
+                        if is_reservation:
+                            op_type = RESERVATION_OPERATION_DISPLAY.get(last["operation_type"], last["operation_type"])
+                            reagent = last.get("reagent_name", "")
+                            batch = last.get("batch_number", "")
+                            self.last_op_var.set(
+                                f"最近可撤销操作：#{last['id']} - {op_type} - {reagent} ({batch}) 数量：{last['quantity']}"
+                            )
+                        else:
+                            op_type = OPERATION_TYPE_DISPLAY.get(last["operation_type"], last["operation_type"])
+                            reagent = last.get("reagent_name", "")
+                            batch = last.get("batch_number", "")
+                            self.last_op_var.set(
+                                f"最近可撤销操作：#{last['id']} - {op_type} - {reagent} ({batch}) 数量：{last['quantity']}"
+                            )
                     else:
                         self.last_op_var.set("没有可撤销的操作")
-                except Exception:
-                    self.last_op_var.set("检查失败")
+                except Exception as e:
+                    self.last_op_var.set(f"检查失败：{str(e)}")
 
             def do_revert():
                 if not messagebox.askyesno("确认", "确定要撤销最近一次操作吗？"):
                     return
                 try:
-                    _, msg = self.manager.revert_last_operation()
+                    from database import OperationDB
+                    last_op = OperationDB.get_last_revertable()
+                    last_res_log = self.manager.get_last_revertable_reservation_log()
+
+                    use_reservation_revert = False
+                    if last_op and last_res_log:
+                        op_time = last_op.get("operation_time", "")
+                        log_time = last_res_log.get("operation_time", "")
+                        if log_time >= op_time:
+                            use_reservation_revert = True
+                    elif last_res_log:
+                        use_reservation_revert = True
+
+                    if use_reservation_revert:
+                        _, msg = self.manager.revert_last_reservation_operation()
+                    else:
+                        _, msg = self.manager.revert_last_operation()
+
                     messagebox.showinfo("成功", msg)
                     check_revertable()
                     self.refresh_inventory()
+                    self.refresh_reservations()
                 except OperationError as e:
                     messagebox.showerror("错误", str(e))
                     check_revertable()
@@ -987,6 +1555,175 @@ class ReagentManagementApp:
             self.history_tree.tag_configure('rejected', background='#ffebee')
 
             self.set_status(f"操作历史：{len(history)} 条记录")
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def setup_reservation_logs_tab(self):
+        frame = self.tab_reservation_logs
+
+        if not self.auth.has_permission("view_reservation_logs"):
+            ttk.Label(frame, text="当前角色无预约日志查看权限", font=('Microsoft YaHei', 14), foreground='gray').pack(pady=50)
+            return
+
+        filter_frame = ttk.LabelFrame(frame, text="筛选条件", padding=10)
+        filter_frame.pack(fill='x', pady=10, padx=10)
+
+        ttk.Label(filter_frame, text="试剂名称：").grid(row=0, column=0, padx=5, pady=5)
+        self.res_log_name = ttk.Entry(filter_frame, width=15)
+        self.res_log_name.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(filter_frame, text="批号：").grid(row=0, column=2, padx=5, pady=5)
+        self.res_log_batch = ttk.Entry(filter_frame, width=15)
+        self.res_log_batch.grid(row=0, column=3, padx=5, pady=5)
+
+        ttk.Label(filter_frame, text="操作类型：").grid(row=0, column=4, padx=5, pady=5)
+        log_types = ["全部", "创建预约", "审批通过", "拒绝预约", "取消预约",
+                     "实际领用", "过期释放", "改期", "撤销操作"]
+        self.res_log_type = ttk.Combobox(filter_frame, values=log_types, state='readonly', width=12)
+        self.res_log_type.grid(row=0, column=5, padx=5, pady=5)
+        self.res_log_type.current(0)
+
+        ttk.Label(filter_frame, text="操作人：").grid(row=1, column=0, padx=5, pady=5)
+        self.res_log_operator = ttk.Entry(filter_frame, width=15)
+        self.res_log_operator.grid(row=1, column=1, padx=5, pady=5)
+
+        ttk.Label(filter_frame, text="开始日期：").grid(row=1, column=2, padx=5, pady=5)
+        self.res_log_start = ttk.Entry(filter_frame, width=15)
+        self.res_log_start.grid(row=1, column=3, padx=5, pady=5)
+
+        ttk.Label(filter_frame, text="结束日期：").grid(row=1, column=4, padx=5, pady=5)
+        self.res_log_end = ttk.Entry(filter_frame, width=15)
+        self.res_log_end.grid(row=1, column=5, padx=5, pady=5)
+
+        ttk.Button(filter_frame, text="查询", command=self.refresh_reservation_logs).grid(row=0, column=6, padx=10, pady=5, rowspan=2)
+        ttk.Button(filter_frame, text="重置", command=self.reset_reservation_log_filters).grid(row=0, column=7, padx=5, pady=5, rowspan=2)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill='x', padx=10, pady=5)
+        ttk.Button(btn_frame, text="刷新", command=self.refresh_reservation_logs).pack(side='left', padx=5)
+
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        columns = ("id", "reservation_id", "op_type", "reagent", "batch", "qty",
+                  "status_before", "status_after", "locked_change", "stock_change",
+                  "operator", "reviewer", "time", "remarks")
+        self.res_log_tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
+
+        headings = [
+            ("id", "日志ID", 70),
+            ("reservation_id", "预约ID", 70),
+            ("op_type", "操作类型", 90),
+            ("reagent", "试剂名称", 130),
+            ("batch", "批号", 110),
+            ("qty", "数量", 70),
+            ("status_before", "变更前状态", 80),
+            ("status_after", "变更后状态", 80),
+            ("locked_change", "锁定变动", 80),
+            ("stock_change", "库存变动", 80),
+            ("operator", "操作人", 90),
+            ("reviewer", "审核人", 90),
+            ("time", "操作时间", 150),
+            ("remarks", "备注", 180)
+        ]
+
+        for col, text, width in headings:
+            self.res_log_tree.heading(col, text=text)
+            self.res_log_tree.column(col, width=width, anchor='center')
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient='vertical', command=self.res_log_tree.yview)
+        self.res_log_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.res_log_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        self.refresh_reservation_logs()
+
+    def reset_reservation_log_filters(self):
+        self.res_log_name.delete(0, 'end')
+        self.res_log_batch.delete(0, 'end')
+        self.res_log_type.current(0)
+        self.res_log_operator.delete(0, 'end')
+        self.res_log_start.delete(0, 'end')
+        self.res_log_end.delete(0, 'end')
+        self.refresh_reservation_logs()
+
+    def get_reservation_log_filters(self):
+        filters = {}
+        name = self.res_log_name.get().strip()
+        if name:
+            filters["reagent_name"] = name
+        batch = self.res_log_batch.get().strip()
+        if batch:
+            filters["batch_number"] = batch
+
+        type_map = {
+            "创建预约": "create",
+            "审批通过": "approve",
+            "拒绝预约": "reject",
+            "取消预约": "cancel",
+            "实际领用": "complete",
+            "过期释放": "expire_release",
+            "改期": "reschedule",
+            "撤销操作": "revert"
+        }
+        type_val = self.res_log_type.get()
+        if type_val in type_map:
+            filters["operation_type"] = type_map[type_val]
+
+        operator = self.res_log_operator.get().strip()
+        if operator:
+            filters["operator_name"] = operator
+
+        date_start = self.res_log_start.get().strip()
+        if date_start:
+            filters["start_date"] = date_start
+        date_end = self.res_log_end.get().strip()
+        if date_end:
+            filters["end_date"] = date_end
+
+        return filters
+
+    def refresh_reservation_logs(self):
+        for item in self.res_log_tree.get_children():
+            self.res_log_tree.delete(item)
+
+        try:
+            filters = self.get_reservation_log_filters()
+            logs = self.manager.get_reservation_logs(filters)
+
+            for log in logs:
+                op_type = RESERVATION_OPERATION_DISPLAY.get(log["operation_type"], log["operation_type"])
+                status_before = RESERVATION_STATUS_DISPLAY.get(log["status_before"], log["status_before"] or "-")
+                status_after = RESERVATION_STATUS_DISPLAY.get(log["status_after"], log["status_after"] or "-")
+
+                locked_change = log.get("locked_qty_change", 0)
+                locked_str = f"+{locked_change}" if locked_change > 0 else str(locked_change) if locked_change != 0 else "-"
+                stock_change = log.get("stock_qty_change", 0)
+                stock_str = f"+{stock_change}" if stock_change > 0 else str(stock_change) if stock_change != 0 else "-"
+
+                tags = ()
+                if log["operation_type"] == "revert":
+                    tags = ('reverted',)
+                elif log["operation_type"] == "expire_release":
+                    tags = ('expired',)
+
+                self.res_log_tree.insert('', 'end', values=(
+                    log["id"], log.get("reservation_id", "-") or "-",
+                    op_type, log.get("reagent_name", "-") or "-",
+                    log.get("batch_number", "-") or "-",
+                    log.get("quantity", "-") or "-",
+                    status_before, status_after,
+                    locked_str, stock_str,
+                    log.get("operator_name", "-") or "-",
+                    log.get("reviewer_name", "-") or "-",
+                    log["operation_time"], log.get("remarks", "") or ""
+                ), tags=tags)
+
+            self.res_log_tree.tag_configure('reverted', background='#e0e0e0', foreground='gray')
+            self.res_log_tree.tag_configure('expired', background='#f5c6cb')
+
+            self.set_status(f"预约日志：{len(logs)} 条记录")
         except OperationError as e:
             messagebox.showerror("错误", str(e))
 
@@ -1233,13 +1970,20 @@ class ReagentManagementApp:
                 return
 
             try:
-                success, skipped, errors = self.csv_manager.import_reagents(filepath)
+                success, skipped, errors, warnings = self.csv_manager.import_reagents(filepath)
                 msg = f"导入完成！\n成功：{success} 条\n跳过：{skipped} 条"
+                if warnings:
+                    msg += f"\n\n⚠️  冲突警告（{len(warnings)} 条）：\n" + "\n".join(warnings[:5])
+                    if len(warnings) > 5:
+                        msg += f"\n... 共 {len(warnings)} 条警告"
                 if errors:
                     msg += f"\n\n错误详情：\n" + "\n".join(errors[:10])
                     if len(errors) > 10:
                         msg += f"\n... 共 {len(errors)} 条错误"
-                messagebox.showinfo("导入结果", msg)
+                if warnings:
+                    messagebox.showwarning("导入结果（含警告）", msg)
+                else:
+                    messagebox.showinfo("导入结果", msg)
                 self.refresh_inventory()
                 self.refresh_history()
             except ValueError as e:
