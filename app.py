@@ -1601,6 +1601,9 @@ class ReagentManagementApp:
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill='x', padx=10, pady=5)
         ttk.Button(btn_frame, text="刷新", command=self.refresh_reservation_logs).pack(side='left', padx=5)
+        if self.auth.has_permission("view_reservation_logs"):
+            ttk.Button(btn_frame, text="导出当前日志 CSV",
+                      command=self.export_reservation_logs_dialog).pack(side='left', padx=5)
 
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
@@ -1726,6 +1729,48 @@ class ReagentManagementApp:
             self.set_status(f"预约日志：{len(logs)} 条记录")
         except OperationError as e:
             messagebox.showerror("错误", str(e))
+
+    def export_reservation_logs_dialog(self):
+        if not self.auth.has_permission("view_reservation_logs"):
+            messagebox.showerror("权限不足", "当前角色无预约日志查看权限，无法导出")
+            return
+
+        filters = self.get_reservation_log_filters()
+
+        current_count = 0
+        try:
+            current_logs = self.manager.get_reservation_logs(filters)
+            current_count = len(current_logs)
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+            return
+
+        if current_count == 0:
+            messagebox.showinfo("提示", "当前没有符合筛选条件的预约日志，无需导出。")
+            return
+
+        default_filename = f"预约日志_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filepath = filedialog.asksaveasfilename(
+            title="导出预约日志 CSV",
+            defaultextension=".csv",
+            initialfile=default_filename,
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
+        )
+
+        if not filepath:
+            return
+
+        try:
+            count, msg = self.csv_manager.export_reservation_logs(filepath, filters)
+            if count == 0:
+                messagebox.showinfo("提示", msg)
+            else:
+                messagebox.showinfo("导出成功", f"{msg}\n\n共导出 {count} 条记录。\n\n文件路径：{filepath}")
+                self.set_status(f"已导出 {count} 条预约日志到 {filepath}")
+        except PermissionError as e:
+            messagebox.showerror("权限不足", str(e))
+        except Exception as e:
+            messagebox.showerror("导出失败", f"导出过程中发生错误：{str(e)}")
 
     def setup_ledger_tab(self):
         frame = self.tab_ledger

@@ -1353,6 +1353,386 @@ def run_tests():
         test_failed("实验员取消权限", str(e))
         failed += 1
 
+    # ============================================
+    # 以下为【预约日志导出】模块新增测试
+    # ============================================
+
+    # Test 31: 预约日志筛选导出
+    print("\n【测试 31】预约日志筛选导出测试")
+    auth.login("admin")
+    try:
+        export_reagent_id, _ = manager.create_reagent(
+            "导出测试试剂", "EXPORT-TEST-001", 100, "瓶",
+            expiration_date=(datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        )
+
+        auth.login("lab_staff")
+        planned_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        export_res_id, _ = manager.create_reservation(
+            export_reagent_id, 20, planned_date, "导出测试-创建"
+        )
+
+        auth.login("auditor")
+        import time
+        time.sleep(0.1)
+        manager.approve_reservation(export_res_id, "导出测试-审批")
+
+        time.sleep(0.1)
+        manager.cancel_reservation(export_res_id, "导出测试-取消")
+
+        auth.login("lab_staff")
+        export_res2_id, _ = manager.create_reservation(
+            export_reagent_id, 15, planned_date, "导出测试-创建2"
+        )
+
+        auth.login("auditor")
+        time.sleep(0.1)
+        manager.approve_reservation(export_res2_id, "导出测试-审批2")
+
+        time.sleep(0.1)
+        manager.complete_reservation(export_res2_id, "导出测试-领用")
+
+        all_logs_before = manager.get_reservation_logs()
+        assert len(all_logs_before) >= 5, f"应该至少有5条日志，实际有{len(all_logs_before)}条"
+
+        export_path = os.path.join(os.path.dirname(DB_PATH), "test_res_logs_all.csv")
+        count, msg = csv_mgr.export_reservation_logs(export_path)
+        assert count >= 5
+        assert os.path.exists(export_path)
+
+        import csv
+        with open(export_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            expected_headers = ["操作时间", "操作人", "预约状态变化", "试剂名称", "批号",
+                               "数量", "锁定量变动", "库存量变动", "备注"]
+            assert headers == expected_headers, f"表头顺序错误。预期：{expected_headers}，实际：{headers}"
+
+            rows = list(reader)
+            assert len(rows) == count
+
+            for row in rows:
+                assert "操作时间" in row and row["操作时间"]
+                assert "操作人" in row
+                assert "预约状态变化" in row and "→" in row["预约状态变化"]
+                assert "试剂名称" in row
+                assert "批号" in row
+                assert "数量" in row
+                assert "锁定量变动" in row
+                assert "库存量变动" in row
+                assert "备注" in row
+
+        test_passed(f"全量预约日志导出成功（{count}条，表头顺序正确）")
+        passed += 1
+
+        approve_filter = {"operation_type": "approve"}
+        approve_logs = manager.get_reservation_logs(approve_filter)
+        approve_count = len(approve_logs)
+        assert approve_count >= 2
+
+        approve_export_path = os.path.join(os.path.dirname(DB_PATH), "test_res_logs_approve.csv")
+        count2, msg2 = csv_mgr.export_reservation_logs(approve_export_path, approve_filter)
+        assert count2 == approve_count
+
+        with open(approve_export_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            rows2 = list(reader)
+            assert len(rows2) == approve_count
+            for row in rows2:
+                assert "待审核 → 已审批" in row["预约状态变化"]
+
+        test_passed(f"按操作类型筛选导出成功（仅审批记录{count2}条）")
+        passed += 1
+
+        reagent_filter = {"reagent_name": "导出测试试剂"}
+        reagent_export_path = os.path.join(os.path.dirname(DB_PATH), "test_res_logs_reagent.csv")
+        count3, msg3 = csv_mgr.export_reservation_logs(reagent_export_path, reagent_filter)
+        assert count3 >= 5
+
+        with open(reagent_export_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                assert row["试剂名称"] == "导出测试试剂"
+
+        test_passed(f"按试剂名称筛选导出成功（{count3}条）")
+        passed += 1
+
+        other_reagent_filter = {"reagent_name": "不存在的试剂"}
+        other_export_path = os.path.join(os.path.dirname(DB_PATH), "test_res_logs_none.csv")
+        count4, msg4 = csv_mgr.export_reservation_logs(other_export_path, other_reagent_filter)
+        assert count4 == 0
+        assert "没有符合条件" in msg4
+        assert not os.path.exists(other_export_path)
+
+        test_passed("筛选结果为空时不生成文件，给出正确提示")
+        passed += 1
+
+        os.remove(export_path)
+        os.remove(approve_export_path)
+        os.remove(reagent_export_path)
+
+    except AssertionError as e:
+        test_failed("预约日志筛选导出", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("预约日志筛选导出", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 32: 预约日志导出权限拒绝
+    print("\n【测试 32】预约日志导出权限拒绝测试")
+    try:
+        class FakeUser:
+            def __init__(self):
+                self.current_user = {"id": 999, "username": "fake", "role": "nonexistent", "display_name": "无权限用户"}
+            def has_permission(self, perm):
+                return False
+
+        fake_auth = FakeUser()
+        fake_csv_mgr = CSVManager(fake_auth)
+
+        no_perm_path = os.path.join(os.path.dirname(DB_PATH), "test_no_perm.csv")
+        try:
+            fake_csv_mgr.export_reservation_logs(no_perm_path)
+            test_failed("无权限导出", "应该失败但成功了")
+            failed += 1
+        except PermissionError as e:
+            assert "权限不足" in str(e)
+            test_passed("无 view_reservation_logs 权限时导出被拒绝（正确）")
+            passed += 1
+        except Exception as e:
+            test_failed("无权限导出", f"异常类型错误：{type(e).__name__}: {e}")
+            failed += 1
+
+        assert not os.path.exists(no_perm_path)
+
+    except Exception as e:
+        test_failed("权限拒绝测试", str(e))
+        failed += 1
+
+    # Test 33: 预约日志导出内容完整性（审批、取消、实际领用）
+    print("\n【测试 33】预约日志导出内容完整性测试")
+    auth.login("admin")
+    try:
+        complete_reagent_id, _ = manager.create_reagent(
+            "完整性测试试剂", "COMPLETE-001", 50, "瓶",
+            expiration_date=(datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        )
+
+        auth.login("lab_staff")
+        planned_date = (datetime.now() + timedelta(days=10)).strftime("%Y-%m-%d")
+        comp_res_id, _ = manager.create_reservation(
+            complete_reagent_id, 10, planned_date, "完整性测试-创建"
+        )
+
+        auth.login("auditor")
+        time.sleep(0.1)
+        manager.approve_reservation(comp_res_id, "完整性测试-审批通过")
+
+        auth.login("lab_staff")
+        comp_res2_id, _ = manager.create_reservation(
+            complete_reagent_id, 8, planned_date, "完整性测试-创建2"
+        )
+
+        auth.login("auditor")
+        time.sleep(0.1)
+        manager.approve_reservation(comp_res2_id, "完整性测试-审批通过2")
+
+        time.sleep(0.1)
+        manager.cancel_reservation(comp_res2_id, "完整性测试-取消")
+
+        auth.login("lab_staff")
+        comp_res3_id, _ = manager.create_reservation(
+            complete_reagent_id, 5, planned_date, "完整性测试-创建3"
+        )
+
+        auth.login("auditor")
+        time.sleep(0.1)
+        manager.approve_reservation(comp_res3_id, "完整性测试-审批通过3")
+
+        time.sleep(0.1)
+        manager.complete_reservation(comp_res3_id, "完整性测试-实际领用")
+
+        all_logs = ReservationLogDB.get_all({"reagent_name": "完整性测试试剂"})
+
+        has_approve = any(l["operation_type"] == "approve" for l in all_logs)
+        has_cancel = any(l["operation_type"] == "cancel" for l in all_logs)
+        has_complete = any(l["operation_type"] == "complete" for l in all_logs)
+
+        assert has_approve, "缺少审批通过日志"
+        assert has_cancel, "缺少取消预约日志"
+        assert has_complete, "缺少实际领用日志"
+
+        complete_export_path = os.path.join(os.path.dirname(DB_PATH), "test_complete_logs.csv")
+        count, msg = csv_mgr.export_reservation_logs(
+            complete_export_path, {"reagent_name": "完整性测试试剂"}
+        )
+
+        with open(complete_export_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+            found_approve = False
+            found_cancel = False
+            found_complete = False
+
+            for row in rows:
+                if "待审核 → 已审批" in row["预约状态变化"]:
+                    found_approve = True
+                    locked = row["锁定量变动"]
+                    assert locked.startswith("+"), f"审批的锁定量变动应为+N，实际是{locked}"
+                elif "已审批 → 已取消" in row["预约状态变化"]:
+                    found_cancel = True
+                    locked = row["锁定量变动"]
+                    assert locked.startswith("-"), f"取消的锁定量变动应为-N，实际是{locked}"
+                elif "已审批 → 已领用" in row["预约状态变化"]:
+                    found_complete = True
+                    locked = row["锁定量变动"]
+                    stock = row["库存量变动"]
+                    assert locked.startswith("-"), f"领用的锁定量变动应为-N，实际是{locked}"
+                    assert stock.startswith("-"), f"领用的库存量变动应为-N，实际是{stock}"
+
+            assert found_approve, "导出内容缺少审批记录"
+            assert found_cancel, "导出内容缺少取消记录"
+            assert found_complete, "导出内容缺少实际领用记录"
+
+        test_passed("导出内容完整性验证通过：包含审批、取消、实际领用三种记录，且变动数值正确")
+        passed += 1
+
+        os.remove(complete_export_path)
+
+    except AssertionError as e:
+        test_failed("导出内容完整性", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("导出内容完整性", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 34: 跨重启数据一致性
+    print("\n【测试 34】预约日志跨重启数据一致性测试")
+    auth.login("admin")
+    try:
+        restart_reagent_id, _ = manager.create_reagent(
+            "重启一致性测试试剂", "RESTART-001", 80, "瓶",
+            expiration_date=(datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        )
+
+        auth.login("lab_staff")
+        planned_date = (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d")
+        restart_res_id, _ = manager.create_reservation(
+            restart_reagent_id, 25, planned_date, "重启测试-创建"
+        )
+
+        auth.login("auditor")
+        time.sleep(0.1)
+        manager.approve_reservation(restart_res_id, "重启测试-审批")
+
+        logs_before = ReservationLogDB.get_all({"reagent_name": "重启一致性测试试剂"})
+        assert len(logs_before) >= 2
+
+        export_before_path = os.path.join(os.path.dirname(DB_PATH), "test_restart_before.csv")
+        count_before, _ = csv_mgr.export_reservation_logs(
+            export_before_path, {"reagent_name": "重启一致性测试试剂"}
+        )
+
+        with open(export_before_path, 'r', encoding='utf-8-sig') as f:
+            reader_before = csv.DictReader(f)
+            data_before = list(reader_before)
+
+        close_db()
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM reservation_logs WHERE reagent_name = '重启一致性测试试剂'")
+        db_count = cursor.fetchone()[0]
+        conn.close()
+
+        assert db_count == count_before, f"数据库记录数({db_count})与导出数({count_before})不一致"
+
+        init_database()
+
+        logs_after = ReservationLogDB.get_all({"reagent_name": "重启一致性测试试剂"})
+        assert len(logs_after) == len(logs_before), f"重启后日志数不一致：前{len(logs_before)}，后{len(logs_after)}"
+
+        export_after_path = os.path.join(os.path.dirname(DB_PATH), "test_restart_after.csv")
+        count_after, _ = csv_mgr.export_reservation_logs(
+            export_after_path, {"reagent_name": "重启一致性测试试剂"}
+        )
+
+        assert count_after == count_before, f"重启后导出数不一致：前{count_before}，后{count_after}"
+
+        with open(export_after_path, 'r', encoding='utf-8-sig') as f:
+            reader_after = csv.DictReader(f)
+            data_after = list(reader_after)
+
+        assert len(data_before) == len(data_after)
+
+        for i, (row_before, row_after) in enumerate(zip(data_before, data_after)):
+            for key in ["操作时间", "操作人", "预约状态变化", "试剂名称", "批号",
+                       "数量", "锁定量变动", "库存量变动", "备注"]:
+                assert row_before[key] == row_after[key], \
+                    f"第{i}行{key}不一致：重启前='{row_before[key]}'，重启后='{row_after[key]}'"
+
+        test_passed(f"跨重启数据一致性验证通过（{count_before}条记录，内容完全一致）")
+        passed += 1
+
+        os.remove(export_before_path)
+        os.remove(export_after_path)
+
+    except AssertionError as e:
+        test_failed("跨重启数据一致性", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("跨重启数据一致性", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 35: CSV 导出 Excel 兼容性（无乱码）
+    print("\n【测试 35】CSV 导出 Excel 兼容性测试")
+    auth.login("admin")
+    try:
+        excel_reagent_id, _ = manager.create_reagent(
+            "Excel测试试剂-中文特殊字符", "EXCEL-测试-001", 100, "瓶",
+            expiration_date=(datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        )
+
+        auth.login("lab_staff")
+        planned_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        excel_res_id, _ = manager.create_reservation(
+            excel_reagent_id, 10, planned_date, "中文备注测试：含有特殊字符@#$%^&*()"
+        )
+
+        auth.login("auditor")
+        time.sleep(0.1)
+        manager.approve_reservation(excel_res_id, "审批意见：含有中文和数字123456")
+
+        excel_export_path = os.path.join(os.path.dirname(DB_PATH), "test_excel_compat.csv")
+        count, _ = csv_mgr.export_reservation_logs(
+            excel_export_path, {"reagent_name": "Excel测试试剂-中文特殊字符"}
+        )
+
+        with open(excel_export_path, 'rb') as f:
+            bom = f.read(3)
+            assert bom == b'\xef\xbb\xbf', "CSV 文件没有 UTF-8 BOM，Excel 打开可能乱码"
+
+        with open(excel_export_path, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+            assert "Excel测试试剂-中文特殊字符" in content, "中文试剂名称丢失或乱码"
+            assert "中文备注测试" in content, "中文备注丢失或乱码"
+            assert "审批意见：含有中文和数字" in content, "中文审批意见丢失或乱码"
+            assert "@#$%^&*()" in content, "特殊字符丢失"
+            assert "待审核 → 已审批" in content, "状态变化中文丢失"
+
+        test_passed("Excel 兼容性验证通过：UTF-8 BOM 正确，中文和特殊字符无乱码")
+        passed += 1
+
+        os.remove(excel_export_path)
+
+    except AssertionError as e:
+        test_failed("Excel 兼容性", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("Excel 兼容性", str(e) if str(e) else "未知错误")
+        failed += 1
+
     # 清理测试数据库
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)

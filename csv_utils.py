@@ -4,8 +4,9 @@ from typing import List, Dict, Tuple
 from datetime import datetime
 
 from database import (ReagentDB, OperationDB, LedgerDB,
-                      ReservationDB, ReagentLockDB)
-from auth import AuthManager, OPERATION_TYPE_DISPLAY, STATUS_DISPLAY
+                      ReservationDB, ReagentLockDB, ReservationLogDB)
+from auth import (AuthManager, OPERATION_TYPE_DISPLAY, STATUS_DISPLAY,
+                  RESERVATION_STATUS_DISPLAY)
 
 
 class CSVManager:
@@ -84,6 +85,63 @@ class CSVManager:
                 ])
 
         return len(ledger), f"成功导出 {len(ledger)} 条台账记录到 {filepath}"
+
+    def export_reservation_logs(self, filepath: str, filters: Dict = None) -> Tuple[int, str]:
+        self._check_permission("view_reservation_logs")
+
+        logs = ReservationLogDB.get_all(filters)
+
+        if not logs:
+            return 0, "没有符合条件的预约日志，未生成导出文件"
+
+        headers = ["操作时间", "操作人", "预约状态变化", "试剂名称", "批号",
+                   "数量", "锁定量变动", "库存量变动", "备注"]
+
+        with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+            for log in logs:
+                status_before = RESERVATION_STATUS_DISPLAY.get(
+                    log.get("status_before"), log.get("status_before") or "-"
+                )
+                status_after = RESERVATION_STATUS_DISPLAY.get(
+                    log.get("status_after"), log.get("status_after") or "-"
+                )
+                status_change = f"{status_before} → {status_after}"
+
+                quantity = log.get("quantity")
+                quantity_str = str(quantity) if quantity is not None else "-"
+
+                locked_change = log.get("locked_qty_change", 0)
+                if locked_change > 0:
+                    locked_str = f"+{locked_change}"
+                elif locked_change < 0:
+                    locked_str = str(locked_change)
+                else:
+                    locked_str = "0"
+
+                stock_change = log.get("stock_qty_change", 0)
+                if stock_change > 0:
+                    stock_str = f"+{stock_change}"
+                elif stock_change < 0:
+                    stock_str = str(stock_change)
+                else:
+                    stock_str = "0"
+
+                writer.writerow([
+                    log.get("operation_time", ""),
+                    log.get("operator_name", "") or "",
+                    status_change,
+                    log.get("reagent_name", "") or "",
+                    log.get("batch_number", "") or "",
+                    quantity_str,
+                    locked_str,
+                    stock_str,
+                    log.get("remarks", "") or ""
+                ])
+
+        return len(logs), f"成功导出 {len(logs)} 条预约日志到 {filepath}"
 
     def import_reagents(self, filepath: str) -> Tuple[int, int, List[str], List[str]]:
         self._check_permission("import_csv")
