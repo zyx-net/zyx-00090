@@ -31,6 +31,8 @@ def run_preflight_tests():
     passed = 0
     failed = 0
 
+    reset_database()
+
     auth = AuthManager()
     manager = ReagentManager(auth)
     csv_mgr = CSVManager(auth)
@@ -42,8 +44,8 @@ def run_preflight_tests():
     # Test 1: 预检不落库测试
     print("\n【测试 1】预检不落库测试")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         sample_path = os.path.join(os.path.dirname(DB_PATH), "test_preview_only.csv")
         csv_mgr.create_sample_import(sample_path)
@@ -90,8 +92,8 @@ def run_preflight_tests():
     # Test 2: 冲突提示测试
     print("\n【测试 2】冲突提示测试（未完成预约冲突检测）")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         reagent_id, _ = manager.create_reagent(
             "冲突测试试剂", "CONFLICT001", 50, "瓶",
@@ -143,8 +145,8 @@ def run_preflight_tests():
     # Test 3: 文件变化后重检测试
     print("\n【测试 3】文件变化后重检测试")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         change_csv_path = os.path.join(os.path.dirname(DB_PATH), "test_file_change.csv")
         with open(change_csv_path, 'w', newline='', encoding='utf-8-sig') as f:
@@ -205,8 +207,8 @@ def run_preflight_tests():
     # Test 4: 无权限拒绝测试
     print("\n【测试 4】无权限拒绝测试（含写库防护验证）")
     try:
-        auth.login("lab_staff")
         reset_database()
+        auth.login("lab_staff")
 
         test_csv_path = os.path.join(os.path.dirname(DB_PATH), "test_permission.csv")
         csv_mgr.create_sample_import(test_csv_path)
@@ -278,8 +280,8 @@ def run_preflight_tests():
     # Test 5: 跨重启记录一致性测试
     print("\n【测试 5】跨重启记录一致性测试（预检不落库，仅导入后写库）")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         persist_csv_path = os.path.join(os.path.dirname(DB_PATH), "test_persist.csv")
         csv_mgr.create_sample_import(persist_csv_path)
@@ -398,8 +400,8 @@ def run_preflight_tests():
     # Test 6: 预检缓存复用测试
     print("\n【测试 6】预检缓存复用测试")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         cache_csv_path = os.path.join(os.path.dirname(DB_PATH), "test_cache.csv")
         csv_mgr.create_sample_import(cache_csv_path)

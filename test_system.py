@@ -1738,8 +1738,8 @@ def run_tests():
     # Test 25: 预检不落库测试
     print("\n【测试 25】预检不落库测试")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         sample_path = os.path.join(os.path.dirname(DB_PATH), "test_preview_only.csv")
         csv_mgr.create_sample_import(sample_path)
@@ -1786,8 +1786,8 @@ def run_tests():
     # Test 26: 冲突提示测试
     print("\n【测试 26】冲突提示测试（未完成预约冲突检测）")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         reagent_id, _ = manager.create_reagent(
             "冲突测试试剂", "CONFLICT001", 50, "瓶",
@@ -1839,8 +1839,8 @@ def run_tests():
     # Test 27: 文件变化后重检测试
     print("\n【测试 27】文件变化后重检测试")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         change_csv_path = os.path.join(os.path.dirname(DB_PATH), "test_file_change.csv")
         with open(change_csv_path, 'w', newline='', encoding='utf-8-sig') as f:
@@ -1902,8 +1902,8 @@ def run_tests():
     # Test 28: 无权限拒绝测试
     print("\n【测试 28】无权限拒绝测试（含写库防护验证）")
     try:
-        auth.login("lab_staff")
         reset_database()
+        auth.login("lab_staff")
 
         test_csv_path = os.path.join(os.path.dirname(DB_PATH), "test_permission.csv")
         csv_mgr.create_sample_import(test_csv_path)
@@ -1975,8 +1975,8 @@ def run_tests():
     # Test 29: 跨重启记录一致性测试
     print("\n【测试 29】跨重启记录一致性测试（预检不落库，仅导入后写库）")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         persist_csv_path = os.path.join(os.path.dirname(DB_PATH), "test_persist.csv")
         csv_mgr.create_sample_import(persist_csv_path)
@@ -2098,8 +2098,8 @@ def run_tests():
     # Test 30: 预检缓存复用测试
     print("\n【测试 30】预检缓存复用测试")
     try:
-        auth.login("admin")
         reset_database()
+        auth.login("admin")
 
         cache_csv_path = os.path.join(os.path.dirname(DB_PATH), "test_cache.csv")
         csv_mgr.create_sample_import(cache_csv_path)
@@ -2219,6 +2219,133 @@ def run_tests():
         failed += 1
     except Exception as e:
         test_failed("GUI 构建", str(e) if str(e) else "未知错误")
+        import traceback
+        traceback.print_exc()
+        failed += 1
+
+    # Test 32: 干净数据库启动测试（空库场景复现验证）
+    print("\n【测试 32】干净数据库启动测试（空库场景复现验证）")
+    try:
+        print("  测试32a: 完全删除数据库，模拟首次运行...")
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        assert not os.path.exists(DB_PATH), "数据库文件应已删除"
+
+        auth2 = AuthManager()
+        manager2 = ReagentManager(auth2)
+        csv_mgr2 = CSVManager(auth2)
+
+        reset_database()
+
+        assert os.path.exists(DB_PATH), "数据库文件应已创建"
+
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        assert cursor.fetchone() is not None, "users 表应已创建"
+        cursor.execute("SELECT COUNT(*) FROM users")
+        assert cursor.fetchone()[0] == 3, f"应创建3个默认用户，实际{cursor.fetchone()[0]}个"
+        conn.close()
+
+        test_passed("干净数据库初始化成功：表结构和默认用户已创建")
+        passed += 1
+
+        print("  测试32b: 空库下预检功能可正常生成结果...")
+        auth2.login("admin")
+
+        clean_test_csv = os.path.join(os.path.dirname(DB_PATH), "test_clean_start.csv")
+        with open(clean_test_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["干净启动测试试剂", "CLEAN001", "50", "瓶"])
+            writer.writerow(["干净启动测试试剂2", "CLEAN002", "100", "瓶"])
+
+        preview_result = csv_mgr2.preview_import(clean_test_csv)
+        assert preview_result["success_count"] == 2, f"预检应成功2条，实际{preview_result['success_count']}"
+        assert preview_result["skip_count"] == 0, f"预检应跳过0条，实际{preview_result['skip_count']}"
+        assert preview_result["total_rows"] == 2, f"总行数应为2，实际{preview_result['total_rows']}"
+        assert len(preview_result["valid_rows"]) == 2, "应有2条有效数据"
+
+        import_results_after = ImportResultDB.get_all(100)
+        assert len(import_results_after) == 0, f"预检后 import_results 表应为空，实际{len(import_results_after)}条"
+
+        test_passed("干净数据库下预检功能正常，结果仅在内存中")
+        passed += 1
+
+        print("  测试32c: 空库下正式导入路径可正常验证...")
+        success, skipped, errors, warnings = csv_mgr2.import_reagents(clean_test_csv)
+        assert success == 2, f"导入应成功2条，实际{success}"
+        assert skipped == 0, f"导入应跳过0条，实际{skipped}"
+
+        import_history = csv_mgr2.get_import_history(10)
+        assert len(import_history) == 1, f"导入后应有1条历史记录，实际{len(import_history)}"
+        assert import_history[0]["success_count"] == 2
+        assert import_history[0]["status"] == "imported"
+
+        reagents = ReagentDB.get_all()
+        assert len(reagents) == 2, f"导入后应有2条试剂，实际{len(reagents)}"
+
+        test_passed("干净数据库下正式导入功能正常，记录已持久化")
+        passed += 1
+
+        print("  测试32d: 空库下无权限角色仍能看到正确禁用提示...")
+        import tkinter as tk
+        from app import ReagentManagementApp
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ReagentManagementApp(root)
+            app.auth.login('lab_staff')
+            app.setup_main_ui()
+
+            assert hasattr(app, 'status_var'), "status_var 应已初始化"
+            assert not app.auth.has_permission('import_csv'), "实验员不应有导入权限"
+            assert not hasattr(app, 'btn_preview'), "无权限时不应创建预检按钮"
+            assert not hasattr(app, 'btn_import'), "无权限时不应创建导入按钮"
+            assert not hasattr(app, 'btn_reset_preview'), "无权限时不应创建重置按钮"
+        finally:
+            root.destroy()
+
+        test_passed("干净数据库下无权限角色禁用提示正常")
+        passed += 1
+
+        print("  测试32e: 空库下Tk GUI构建验证...")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ReagentManagementApp(root)
+            app.auth.login('admin')
+            app.setup_main_ui()
+
+            assert hasattr(app, 'status_var'), "status_var 应已初始化"
+            assert hasattr(app, 'import_status_var'), "import_status_var 应已初始化"
+            assert hasattr(app, 'btn_preview'), "btn_preview 应已创建"
+            assert hasattr(app, 'btn_import'), "btn_import 应已创建"
+            assert hasattr(app, 'btn_reset_preview'), "btn_reset_preview 应已创建"
+
+            app.notebook.select(app.tab_import_export)
+            tab_text = app.notebook.tab(app.notebook.select(), 'text')
+            assert tab_text == '导入导出', f"导入导出标签页应可访问"
+
+            import_status = app.import_status_var.get()
+            assert '请选择CSV文件' in import_status, f"导入页状态提示应正确，实际'{import_status}'"
+
+            btn_preview_state = str(app.btn_preview.cget('state'))
+            assert btn_preview_state == 'disabled', f"未选文件时预检按钮应禁用"
+        finally:
+            root.destroy()
+
+        test_passed("干净数据库下Tk GUI构建成功，导入入口正常")
+        passed += 1
+
+        os.remove(clean_test_csv)
+    except AssertionError as e:
+        test_failed("干净数据库启动", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("干净数据库启动", str(e) if str(e) else "未知错误")
         import traceback
         traceback.print_exc()
         failed += 1
