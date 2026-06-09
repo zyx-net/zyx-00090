@@ -7,7 +7,8 @@ from datetime import datetime
 
 from database import (ReagentDB, OperationDB, LedgerDB,
                       ReservationDB, ReagentLockDB, ReservationLogDB, ImportResultDB,
-                      ImportPlanDB, ImportPlanItemDB, ImportAuditLogDB, get_connection)
+                      ImportPlanDB, ImportPlanItemDB, ImportAuditLogDB, get_connection,
+                      StocktakeOrderDB, StocktakeItemDB, StocktakeLogDB)
 from auth import (AuthManager, OPERATION_TYPE_DISPLAY, STATUS_DISPLAY,
                   RESERVATION_STATUS_DISPLAY)
 
@@ -1399,3 +1400,194 @@ class CSVManager:
             writer.writerows(sample_data)
 
         return f"样例文件已创建：{filepath}"
+
+    def parse_stocktake_csv(self, filepath: str) -> List[Dict]:
+        self._check_permission("import_stocktake")
+
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"文件不存在：{filepath}")
+
+        required_fields = ["试剂名称", "批号", "实盘数量"]
+        rows = []
+        errors = []
+
+        with open(filepath, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+
+            for field in required_fields:
+                if field not in reader.fieldnames:
+                    raise ValueError(f"CSV 文件缺少必要列：{field}")
+
+            for row_num, row in enumerate(reader, start=2):
+                reagent_name = row.get("试剂名称", "").strip()
+                batch_number = row.get("批号", "").strip()
+                actual_quantity_str = row.get("实盘数量", "").strip()
+                storage_location = row.get("存放位置", "").strip()
+                unit = row.get("单位", "").strip()
+                diff_reason = row.get("差异原因", "").strip()
+
+                if not reagent_name or not batch_number:
+                    errors.append(f"第 {row_num} 行：试剂名称和批号不能为空")
+                    continue
+
+                try:
+                    actual_quantity = int(actual_quantity_str) if actual_quantity_str else 0
+                except ValueError:
+                    errors.append(f"第 {row_num} 行：实盘数量必须是整数")
+                    continue
+
+                if actual_quantity < 0:
+                    errors.append(f"第 {row_num} 行：实盘数量不能为负数")
+                    continue
+
+                rows.append({
+                    "试剂名称": reagent_name,
+                    "批号": batch_number,
+                    "实盘数量": actual_quantity,
+                    "存放位置": storage_location,
+                    "单位": unit,
+                    "差异原因": diff_reason
+                })
+
+        if errors:
+            raise ValueError("\n".join(errors))
+
+        return rows
+
+    def export_stocktake_order(self, filepath: str, order_id: int,
+                            stocktake_manager) -> Tuple[int, str]:
+        self._check_permission("export_stocktake")
+
+        from auth import (STOCKTAKE_ORDER_STATUS_DISPLAY,
+                         STOCKTAKE_PROCESS_STATUS_DISPLAY,
+                         STOCKTAKE_CONFLICT_TYPE_DISPLAY)
+
+        order = stocktake_manager.get_order_by_id(order_id)
+        if not order:
+            raise ValueError("盘点单不存在")
+
+        items = stocktake_manager.get_items(order_id)
+
+        order_status = STOCKTAKE_ORDER_STATUS_DISPLAY.get(order["status"], order["status"])
+
+        headers = ["盘点单号", "盘点单标题", "状态", "试剂名称", "批号", "存放位置",
+                  "账面数", "实盘数", "差异数", "单位", "过期日期",
+                  "冲突类型", "处理状态", "差异原因", "创建时间", "更新时间"]
+
+        with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+            for item in items:
+                conflict_type = STOCKTAKE_CONFLICT_TYPE_DISPLAY.get(
+                    item.get("conflict_type", "none"), item.get("conflict_type", "none")
+                )
+                process_status = STOCKTAKE_PROCESS_STATUS_DISPLAY.get(
+                    item.get("process_status", "pending"), item.get("process_status", "pending")
+                )
+
+                writer.writerow([
+                    order["order_no"],
+                    order["title"],
+                    order_status,
+                    item["reagent_name"],
+                    item["batch_number"],
+                    item.get("storage_location", "") or "",
+                    item["expected_quantity"],
+                    item["actual_quantity"],
+                    item["diff_quantity"],
+                    item.get("unit", "") or "",
+                    item.get("expiration_date", "") or "",
+                    conflict_type,
+                    process_status,
+                    item.get("diff_reason", "") or "",
+                    item.get("created_at", "") or "",
+                    item.get("updated_at", "") or ""
+                ])
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="export",
+            order_id=order_id,
+            remarks=f"导出盘点单：{order['order_no']} - {order['title']}"
+        )
+
+        return len(items), f"成功导出 {len(items)} 条盘点数据到 {filepath}"
+
+    def export_stocktake_logs(self, filepath: str, filters: Dict = None) -> Tuple[int, str]:
+        self._check_permission("export_stocktake")
+
+        from auth import STOCKTAKE_OPERATION_TYPE_DISPLAY
+
+        logs = StocktakeLogDB.get_all(filters)
+
+        headers = ["操作时间", "操作人", "操作类型", "盘点单号", "试剂名称",
+                  "批号", "原值", "新值", "差异原因", "备注"]
+
+        with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+            for log in logs:
+                op_type = STOCKTAKE_OPERATION_TYPE_DISPLAY.get(
+                    log.get("operation_type", ""), log.get("operation_type", "")
+                )
+
+                order_no = ""
+                if log.get("order_id"):
+                    order = StocktakeOrderDB.get_by_id(log["order_id"])
+                    if order:
+                        order_no = order["order_no"]
+
+                writer.writerow([
+                    log.get("operation_time", "") or "",
+                    log.get("operator_name", "") or "",
+                    op_type,
+                    order_no,
+                    log.get("reagent_name", "") or "",
+                    log.get("batch_number", "") or "",
+                    log.get("old_value", "") or "",
+                    log.get("new_value", "") or "",
+                    log.get("diff_reason", "") or "",
+                    log.get("remarks", "") or ""
+                ])
+
+        return len(logs), f"成功导出 {len(logs)} 条盘点日志到 {filepath}"
+
+    def create_stocktake_sample_import(self, filepath: str) -> str:
+        sample_data = [
+            {
+                "试剂名称": "无水乙醇",
+                "批号": "20250101",
+                "实盘数量": "95",
+                "单位": "瓶",
+                "存放位置": "阴凉柜A区",
+                "差异原因": "使用未登记"
+            },
+            {
+                "试剂名称": "氯化钠",
+                "批号": "20250215",
+                "实盘数量": "50",
+                "单位": "瓶",
+                "存放位置": "常温柜B区",
+                "差异原因": ""
+            },
+            {
+                "试剂名称": "甲醇",
+                "批号": "20241201",
+                "实盘数量": "28",
+                "单位": "瓶",
+                "存放位置": "防爆柜",
+                "差异原因": "破损1瓶，挥发1瓶"
+            }
+        ]
+
+        headers = ["试剂名称", "批号", "实盘数量", "单位", "存放位置", "差异原因"]
+
+        with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(sample_data)
+
+        return f"盘点样例文件已创建：{filepath}"

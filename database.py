@@ -350,6 +350,79 @@ def init_database():
             default_users
         )
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stocktake_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_no TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('draft', 'confirmed', 'cancelled')),
+            storage_location TEXT,
+            remarks TEXT,
+            total_items INTEGER DEFAULT 0,
+            confirmed_items INTEGER DEFAULT 0,
+            operator_id INTEGER NOT NULL,
+            operator_name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            confirmed_at TIMESTAMP,
+            FOREIGN KEY (operator_id) REFERENCES users(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stocktake_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            reagent_name TEXT NOT NULL,
+            batch_number TEXT NOT NULL,
+            storage_location TEXT,
+            expected_quantity INTEGER NOT NULL DEFAULT 0,
+            actual_quantity INTEGER NOT NULL DEFAULT 0,
+            diff_quantity INTEGER NOT NULL DEFAULT 0,
+            unit TEXT,
+            expiration_date TEXT,
+            low_stock_threshold INTEGER DEFAULT 10,
+            reagent_id INTEGER,
+            conflict_type TEXT CHECK(conflict_type IN (
+                'expired', 'low_stock', 'batch_not_found', 'none'
+            )) DEFAULT 'none',
+            process_status TEXT CHECK(process_status IN (
+                'pending', 'confirmed', 'skipped'
+            )) DEFAULT 'pending',
+            diff_reason TEXT,
+            snapshot_before TEXT,
+            snapshot_after TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (order_id) REFERENCES stocktake_orders(id) ON DELETE CASCADE,
+            FOREIGN KEY (reagent_id) REFERENCES reagents(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stocktake_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER,
+            item_id INTEGER,
+            operator_id INTEGER NOT NULL,
+            operator_name TEXT NOT NULL,
+            operation_type TEXT NOT NULL CHECK(operation_type IN (
+                'create_order', 'update_item', 'import_items', 'confirm_item',
+                'confirm_batch', 'write_back', 'cancel_order', 'export'
+            )),
+            reagent_name TEXT,
+            batch_number TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            diff_reason TEXT,
+            operation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            remarks TEXT,
+            FOREIGN KEY (order_id) REFERENCES stocktake_orders(id) ON DELETE SET NULL,
+            FOREIGN KEY (item_id) REFERENCES stocktake_items(id) ON DELETE SET NULL,
+            FOREIGN KEY (operator_id) REFERENCES users(id)
+        )
+    """)
+
     cursor.execute("SELECT COUNT(*) FROM app_config WHERE key = 'initialized'")
     if cursor.fetchone()[0] == 0:
         cursor.execute(
@@ -1547,6 +1620,395 @@ class ImportAuditLogDB:
             return [dict(row) for row in rows]
         finally:
             conn.close()
+
+
+class StocktakeOrderDB:
+    @staticmethod
+    def generate_order_no() -> str:
+        now = datetime.now()
+        import random
+        random_str = ''.join(random.choices('0123456789', k=6))
+        return f"STK{now.strftime('%Y%m%d%H%M%S')}{random_str}"
+
+    @staticmethod
+    def create(title: str, operator_id: int, operator_name: str,
+               storage_location: str = "", remarks: str = "") -> int:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            order_no = StocktakeOrderDB.generate_order_no()
+            cursor.execute("""
+                INSERT INTO stocktake_orders (
+                    order_no, title, status, storage_location, remarks,
+                    operator_id, operator_name
+                ) VALUES (?, ?, 'draft', ?, ?, ?, ?)
+            """, (order_no, title, storage_location, remarks, operator_id, operator_name))
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update_counts(order_id: int) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN process_status = 'confirmed' THEN 1 ELSE 0 END) as confirmed
+                FROM stocktake_items
+                WHERE order_id = ?
+            """, (order_id,))
+            row = cursor.fetchone()
+            total = row["total"] if row else 0
+            confirmed = row["confirmed"] if row and row["confirmed"] else 0
+            cursor.execute("""
+                UPDATE stocktake_orders
+                SET total_items = ?, confirmed_items = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (total, confirmed, order_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update_status(order_id: int, status: str) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            fields = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+            params = [status]
+            if status == 'confirmed':
+                fields.append("confirmed_at = CURRENT_TIMESTAMP")
+            params.append(order_id)
+            cursor.execute(
+                f"UPDATE stocktake_orders SET {', '.join(fields)} WHERE id = ?",
+                params
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_id(order_id: int) -> Optional[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM stocktake_orders WHERE id = ?", (order_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_order_no(order_no: str) -> Optional[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM stocktake_orders WHERE order_no = ?", (order_no,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_all(filters: Dict = None) -> List[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        query = "SELECT * FROM stocktake_orders WHERE 1=1"
+        params = []
+
+        if filters:
+            if filters.get("status"):
+                query += " AND status = ?"
+                params.append(filters["status"])
+            if filters.get("operator_id"):
+                query += " AND operator_id = ?"
+                params.append(filters["operator_id"])
+            if filters.get("order_no"):
+                query += " AND order_no LIKE ?"
+                params.append(f"%{filters['order_no']}%")
+            if filters.get("title"):
+                query += " AND title LIKE ?"
+                params.append(f"%{filters['title']}%")
+            if filters.get("start_date"):
+                query += " AND DATE(created_at) >= ?"
+                params.append(filters["start_date"])
+            if filters.get("end_date"):
+                query += " AND DATE(created_at) <= ?"
+                params.append(filters["end_date"])
+            if filters.get("storage_location"):
+                query += " AND storage_location LIKE ?"
+                params.append(f"%{filters['storage_location']}%")
+
+        query += " ORDER BY created_at DESC"
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+
+class StocktakeItemDB:
+    @staticmethod
+    def create(order_id: int, reagent_name: str, batch_number: str,
+               expected_quantity: int = 0, actual_quantity: int = 0,
+               unit: str = "", storage_location: str = "",
+               expiration_date: str = None, low_stock_threshold: int = 10,
+               reagent_id: int = None, diff_reason: str = "",
+               conflict_type: str = "none", process_status: str = "pending") -> int:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            diff = actual_quantity - expected_quantity
+            cursor.execute("""
+                INSERT INTO stocktake_items (
+                    order_id, reagent_name, batch_number, storage_location,
+                    expected_quantity, actual_quantity, diff_quantity,
+                    unit, expiration_date, low_stock_threshold, reagent_id,
+                    conflict_type, process_status, diff_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (order_id, reagent_name, batch_number, storage_location,
+                  expected_quantity, actual_quantity, diff, unit, expiration_date,
+                  low_stock_threshold, reagent_id, conflict_type, process_status, diff_reason))
+            conn.commit()
+            item_id = cursor.lastrowid
+            StocktakeOrderDB.update_counts(order_id)
+            return item_id
+        finally:
+            conn.close()
+
+    @staticmethod
+    def bulk_create(order_id: int, items: List[Dict]) -> List[int]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        item_ids = []
+        try:
+            for item in items:
+                diff = item.get("actual_quantity", 0) - item.get("expected_quantity", 0)
+                cursor.execute("""
+                    INSERT INTO stocktake_items (
+                        order_id, reagent_name, batch_number, storage_location,
+                        expected_quantity, actual_quantity, diff_quantity,
+                        unit, expiration_date, low_stock_threshold, reagent_id,
+                        conflict_type, process_status, diff_reason, snapshot_before
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    order_id,
+                    item.get("reagent_name", ""),
+                    item.get("batch_number", ""),
+                    item.get("storage_location", ""),
+                    item.get("expected_quantity", 0),
+                    item.get("actual_quantity", 0),
+                    diff,
+                    item.get("unit", ""),
+                    item.get("expiration_date"),
+                    item.get("low_stock_threshold", 10),
+                    item.get("reagent_id"),
+                    item.get("conflict_type", "none"),
+                    item.get("process_status", "pending"),
+                    item.get("diff_reason", ""),
+                    item.get("snapshot_before", "")
+                ))
+                item_ids.append(cursor.lastrowid)
+            conn.commit()
+            StocktakeOrderDB.update_counts(order_id)
+            return item_ids
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update(item_id: int, **kwargs) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            fields = ["updated_at = CURRENT_TIMESTAMP"]
+            params = []
+            allowed_fields = [
+                "reagent_name", "batch_number", "storage_location",
+                "expected_quantity", "actual_quantity", "unit",
+                "expiration_date", "low_stock_threshold", "reagent_id",
+                "conflict_type", "process_status", "diff_reason",
+                "snapshot_before", "snapshot_after"
+            ]
+            for key, value in kwargs.items():
+                if key in allowed_fields:
+                    fields.append(f"{key} = ?")
+                    params.append(value)
+            if "expected_quantity" in kwargs or "actual_quantity" in kwargs:
+                item = StocktakeItemDB.get_by_id(item_id)
+                if item:
+                    expected = kwargs.get("expected_quantity", item["expected_quantity"])
+                    actual = kwargs.get("actual_quantity", item["actual_quantity"])
+                    diff = actual - expected
+                    fields.append("diff_quantity = ?")
+                    params.append(diff)
+            params.append(item_id)
+            cursor.execute(
+                f"UPDATE stocktake_items SET {', '.join(fields)} WHERE id = ?",
+                params
+            )
+            conn.commit()
+            if cursor.rowcount > 0:
+                item = StocktakeItemDB.get_by_id(item_id)
+                if item:
+                    StocktakeOrderDB.update_counts(item["order_id"])
+                return True
+            return False
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_id(item_id: int) -> Optional[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            import json
+            cursor.execute("SELECT * FROM stocktake_items WHERE id = ?", (item_id,))
+            row = cursor.fetchone()
+            if row:
+                item = dict(row)
+                for key in ['snapshot_before', 'snapshot_after']:
+                    if item.get(key):
+                        try:
+                            item[key] = json.loads(item[key])
+                        except Exception:
+                            pass
+                return item
+            return None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_order_id(order_id: int, filters: Dict = None) -> List[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        query = "SELECT * FROM stocktake_items WHERE order_id = ?"
+        params = [order_id]
+
+        if filters:
+            if filters.get("reagent_name"):
+                query += " AND reagent_name LIKE ?"
+                params.append(f"%{filters['reagent_name']}%")
+            if filters.get("batch_number"):
+                query += " AND batch_number LIKE ?"
+                params.append(f"%{filters['batch_number']}%")
+            if filters.get("storage_location"):
+                query += " AND storage_location LIKE ?"
+                params.append(f"%{filters['storage_location']}%")
+            if filters.get("process_status"):
+                query += " AND process_status = ?"
+                params.append(filters["process_status"])
+            if filters.get("conflict_type"):
+                query += " AND conflict_type = ?"
+                params.append(filters["conflict_type"])
+            if filters.get("has_diff") is True:
+                query += " AND diff_quantity != 0"
+            if filters.get("has_diff") is False:
+                query += " AND diff_quantity = 0"
+
+        query += " ORDER BY created_at ASC"
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        items = []
+        import json
+        for row in rows:
+            item = dict(row)
+            for key in ['snapshot_before', 'snapshot_after']:
+                if item.get(key):
+                    try:
+                        item[key] = json.loads(item[key])
+                    except Exception:
+                        pass
+            items.append(item)
+        return items
+
+    @staticmethod
+    def get_pending_items(order_id: int) -> List[Dict]:
+        return StocktakeItemDB.get_by_order_id(order_id, {"process_status": "pending"})
+
+    @staticmethod
+    def delete(item_id: int) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            item = StocktakeItemDB.get_by_id(item_id)
+            if not item:
+                return False
+            order_id = item["order_id"]
+            cursor.execute("DELETE FROM stocktake_items WHERE id = ?", (item_id,))
+            conn.commit()
+            StocktakeOrderDB.update_counts(order_id)
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+
+class StocktakeLogDB:
+    @staticmethod
+    def create(operator_id: int, operator_name: str, operation_type: str,
+               order_id: int = None, item_id: int = None, reagent_name: str = "",
+               batch_number: str = "", old_value: str = "", new_value: str = "",
+               diff_reason: str = "", remarks: str = "") -> int:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO stocktake_logs (
+                    order_id, item_id, operator_id, operator_name,
+                    operation_type, reagent_name, batch_number,
+                    old_value, new_value, diff_reason, remarks
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                order_id, item_id, operator_id, operator_name,
+                operation_type, reagent_name, batch_number,
+                old_value, new_value, diff_reason, remarks
+            ))
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_all(filters: Dict = None) -> List[Dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        query = "SELECT * FROM stocktake_logs WHERE 1=1"
+        params = []
+
+        if filters:
+            if filters.get("order_id"):
+                query += " AND order_id = ?"
+                params.append(filters["order_id"])
+            if filters.get("item_id"):
+                query += " AND item_id = ?"
+                params.append(filters["item_id"])
+            if filters.get("operation_type"):
+                query += " AND operation_type = ?"
+                params.append(filters["operation_type"])
+            if filters.get("operator_id"):
+                query += " AND operator_id = ?"
+                params.append(filters["operator_id"])
+            if filters.get("reagent_name"):
+                query += " AND reagent_name LIKE ?"
+                params.append(f"%{filters['reagent_name']}%")
+            if filters.get("batch_number"):
+                query += " AND batch_number LIKE ?"
+                params.append(f"%{filters['batch_number']}%")
+            if filters.get("start_date"):
+                query += " AND DATE(operation_time) >= ?"
+                params.append(filters["start_date"])
+            if filters.get("end_date"):
+                query += " AND DATE(operation_time) <= ?"
+                params.append(filters["end_date"])
+
+        query += " ORDER BY operation_time DESC"
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
 
 
 def close_db():

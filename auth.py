@@ -29,6 +29,14 @@ ROLE_PERMISSIONS = {
         "release_expired_reservations": True,
         "revert_import": True,
         "view_import_audit": True,
+        "view_stocktake": True,
+        "create_stocktake_order": True,
+        "edit_stocktake_item": True,
+        "import_stocktake": True,
+        "confirm_stocktake": True,
+        "write_back_stocktake": True,
+        "cancel_stocktake_order": True,
+        "export_stocktake": True,
     },
     "lab_staff": {
         "view_inventory": True,
@@ -56,6 +64,14 @@ ROLE_PERMISSIONS = {
         "release_expired_reservations": False,
         "revert_import": False,
         "view_import_audit": False,
+        "view_stocktake": True,
+        "create_stocktake_order": False,
+        "edit_stocktake_item": False,
+        "import_stocktake": False,
+        "confirm_stocktake": False,
+        "write_back_stocktake": False,
+        "cancel_stocktake_order": False,
+        "export_stocktake": True,
     },
     "auditor": {
         "view_inventory": True,
@@ -83,6 +99,14 @@ ROLE_PERMISSIONS = {
         "release_expired_reservations": True,
         "revert_import": True,
         "view_import_audit": True,
+        "view_stocktake": True,
+        "create_stocktake_order": True,
+        "edit_stocktake_item": True,
+        "import_stocktake": True,
+        "confirm_stocktake": True,
+        "write_back_stocktake": True,
+        "cancel_stocktake_order": True,
+        "export_stocktake": True,
     }
 }
 
@@ -132,6 +156,36 @@ STATUS_DISPLAY = {
     "completed": "已完成",
     "cancelled": "已取消",
     "reverted": "已撤销"
+}
+
+STOCKTAKE_ORDER_STATUS_DISPLAY = {
+    "draft": "草稿",
+    "confirmed": "已确认",
+    "cancelled": "已取消"
+}
+
+STOCKTAKE_PROCESS_STATUS_DISPLAY = {
+    "pending": "待确认",
+    "confirmed": "已确认",
+    "skipped": "已跳过"
+}
+
+STOCKTAKE_CONFLICT_TYPE_DISPLAY = {
+    "none": "无冲突",
+    "expired": "已过期",
+    "low_stock": "低于安全库存",
+    "batch_not_found": "批号不存在"
+}
+
+STOCKTAKE_OPERATION_TYPE_DISPLAY = {
+    "create_order": "创建盘点单",
+    "update_item": "更新盘点项",
+    "import_items": "导入盘点项",
+    "confirm_item": "确认单条",
+    "confirm_batch": "批量确认",
+    "write_back": "写回库存",
+    "cancel_order": "取消盘点单",
+    "export": "导出数据"
 }
 
 

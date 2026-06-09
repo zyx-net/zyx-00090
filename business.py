@@ -3,7 +3,8 @@ from typing import Dict, Optional, Tuple, List
 from datetime import datetime
 
 from database import (ReagentDB, OperationDB, LedgerDB, UserDB,
-                      ReservationDB, ReservationLogDB, ReagentLockDB)
+                      ReservationDB, ReservationLogDB, ReagentLockDB,
+                      StocktakeOrderDB, StocktakeItemDB, StocktakeLogDB)
 from auth import AuthManager, OPERATION_TYPE_DISPLAY, RESERVATION_OPERATION_DISPLAY
 
 
@@ -1098,3 +1099,586 @@ class ReagentManager:
     def get_last_revertable_reservation_log(self) -> Optional[Dict]:
         self._check_permission("revert_operation")
         return ReservationLogDB.get_last_revertable()
+
+
+class StocktakeManager:
+    def __init__(self, auth: AuthManager):
+        self.auth = auth
+
+    def _check_permission(self, permission: str) -> None:
+        if not self.auth.has_permission(permission):
+            raise OperationError(f"权限不足：当前角色无此操作权限")
+
+    def create_order(self, title: str, storage_location: str = "",
+                   remarks: str = "",
+                   auto_fill_from_inventory: bool = False) -> Tuple[int, str]:
+        self._check_permission("create_stocktake_order")
+
+        if not title or not title.strip():
+            raise OperationError("盘点单标题不能为空")
+
+        order_id = StocktakeOrderDB.create(
+            title=title.strip(),
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            storage_location=storage_location.strip(),
+            remarks=remarks.strip()
+        )
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="create_order",
+            order_id=order_id,
+            remarks=f"创建盘点单：{title}"
+        )
+
+        if auto_fill_from_inventory:
+            reagents = ReagentDB.get_all()
+            items = []
+            for reagent in reagents:
+                conflict_type = "none"
+                if ReagentDB.is_expired(reagent["id"]):
+                    conflict_type = "expired"
+                elif reagent["quantity"] <= reagent["low_stock_threshold"]:
+                    conflict_type = "low_stock"
+
+                snapshot_before = json.dumps(reagent, ensure_ascii=False)
+
+                items.append({
+                    "reagent_name": reagent["name"],
+                    "batch_number": reagent["batch_number"],
+                    "storage_location": reagent.get("storage_condition", ""),
+                    "expected_quantity": reagent["quantity"],
+                    "actual_quantity": reagent["quantity"],
+                    "unit": reagent["unit"],
+                    "expiration_date": reagent.get("expiration_date"),
+                    "low_stock_threshold": reagent["low_stock_threshold"],
+                    "reagent_id": reagent["id"],
+                    "conflict_type": conflict_type,
+                    "snapshot_before": snapshot_before
+                })
+
+            if items:
+                StocktakeItemDB.bulk_create(order_id, items)
+                StocktakeLogDB.create(
+                    operator_id=self.auth.current_user["id"],
+                    operator_name=self.auth.current_user["display_name"],
+                    operation_type="import_items",
+                    order_id=order_id,
+                    remarks=f"自动填充库存数据：{len(items)} 条"
+                )
+
+        return order_id, f"盘点单创建成功，单号：{StocktakeOrderDB.get_by_id(order_id)['order_no']}"
+
+    def get_orders(self, filters: Dict = None) -> List[Dict]:
+        self._check_permission("view_stocktake")
+        return StocktakeOrderDB.get_all(filters)
+
+    def get_order_by_id(self, order_id: int) -> Optional[Dict]:
+        self._check_permission("view_stocktake")
+        return StocktakeOrderDB.get_by_id(order_id)
+
+    def get_items(self, order_id: int, filters: Dict = None) -> List[Dict]:
+        self._check_permission("view_stocktake")
+        return StocktakeItemDB.get_by_order_id(order_id, filters)
+
+    def add_item(self, order_id: int, reagent_name: str, batch_number: str,
+                 actual_quantity: int, storage_location: str = "",
+                 unit: str = "", diff_reason: str = "") -> Tuple[int, str]:
+        self._check_permission("edit_stocktake_item")
+
+        order = StocktakeOrderDB.get_by_id(order_id)
+        if not order:
+            raise OperationError("盘点单不存在")
+        if order["status"] != "draft":
+            raise OperationError("只能在草稿状态下添加盘点项")
+
+        if not reagent_name or not reagent_name.strip():
+            raise OperationError("试剂名称不能为空")
+        if not batch_number or not batch_number.strip():
+            raise OperationError("批号不能为空")
+        if actual_quantity < 0:
+            raise OperationError("实际数量不能为负数")
+
+        reagent = ReagentDB.get_by_name_and_batch(
+            reagent_name.strip(), batch_number.strip()
+        )
+
+        expected_quantity = 0
+        conflict_type = "none"
+        reagent_id = None
+        snapshot_before = ""
+
+        if reagent:
+            expected_quantity = reagent["quantity"]
+            reagent_id = reagent["id"]
+            snapshot_before = json.dumps(reagent, ensure_ascii=False)
+
+            if ReagentDB.is_expired(reagent["id"]):
+                conflict_type = "expired"
+            elif reagent["quantity"] <= reagent["low_stock_threshold"]:
+                conflict_type = "low_stock"
+        else:
+            conflict_type = "batch_not_found"
+
+        item_id = StocktakeItemDB.create(
+            order_id=order_id,
+            reagent_name=reagent_name.strip(),
+            batch_number=batch_number.strip(),
+            expected_quantity=expected_quantity,
+            actual_quantity=actual_quantity,
+            unit=unit.strip(),
+            storage_location=storage_location.strip(),
+            expiration_date=reagent.get("expiration_date") if reagent else None,
+            low_stock_threshold=reagent["low_stock_threshold"] if reagent else 10,
+            reagent_id=reagent_id,
+            diff_reason=diff_reason.strip(),
+            conflict_type=conflict_type,
+            process_status="pending" if conflict_type != "none" else "pending"
+        )
+
+        if snapshot_before:
+            StocktakeItemDB.update(item_id, snapshot_before=snapshot_before)
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="update_item",
+            order_id=order_id,
+            item_id=item_id,
+            reagent_name=reagent_name.strip(),
+            batch_number=batch_number.strip(),
+            old_value=str(expected_quantity),
+            new_value=str(actual_quantity),
+            diff_reason=diff_reason.strip(),
+            remarks="添加盘点项"
+        )
+
+        return item_id, "盘点项添加成功"
+
+    def update_item(self, item_id: int, actual_quantity: int = None,
+                    diff_reason: str = None,
+                    storage_location: str = None) -> Tuple[bool, str]:
+        self._check_permission("edit_stocktake_item")
+
+        item = StocktakeItemDB.get_by_id(item_id)
+        if not item:
+            raise OperationError("盘点项不存在")
+
+        order = StocktakeOrderDB.get_by_id(item["order_id"])
+        if not order or order["status"] != "draft":
+            raise OperationError("只能在草稿状态下修改盘点项")
+
+        update_kwargs = {}
+        old_values = {}
+        new_values = {}
+
+        if actual_quantity is not None:
+            if actual_quantity < 0:
+                raise OperationError("实际数量不能为负数")
+            update_kwargs["actual_quantity"] = actual_quantity
+            old_values["actual_quantity"] = item["actual_quantity"]
+            new_values["actual_quantity"] = actual_quantity
+
+        if diff_reason is not None:
+            update_kwargs["diff_reason"] = diff_reason.strip()
+            old_values["diff_reason"] = item.get("diff_reason", "")
+            new_values["diff_reason"] = diff_reason.strip()
+
+        if storage_location is not None:
+            update_kwargs["storage_location"] = storage_location.strip()
+            old_values["storage_location"] = item.get("storage_location", "")
+            new_values["storage_location"] = storage_location.strip()
+
+        if not update_kwargs:
+            return False, "没有需要更新的内容"
+
+        success = StocktakeItemDB.update(item_id, **update_kwargs)
+        if not success:
+            raise OperationError("更新失败")
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="update_item",
+            order_id=item["order_id"],
+            item_id=item_id,
+            reagent_name=item["reagent_name"],
+            batch_number=item["batch_number"],
+            old_value=json.dumps(old_values, ensure_ascii=False),
+            new_value=json.dumps(new_values, ensure_ascii=False),
+            remarks="更新盘点项"
+        )
+
+        return True, "盘点项更新成功"
+
+    def delete_item(self, item_id: int) -> Tuple[bool, str]:
+        self._check_permission("edit_stocktake_item")
+
+        item = StocktakeItemDB.get_by_id(item_id)
+        if not item:
+            raise OperationError("盘点项不存在")
+
+        order = StocktakeOrderDB.get_by_id(item["order_id"])
+        if not order or order["status"] != "draft":
+            raise OperationError("只能在草稿状态下删除盘点项")
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="update_item",
+            order_id=item["order_id"],
+            item_id=None,
+            reagent_name=item["reagent_name"],
+            batch_number=item["batch_number"],
+            old_value=str(item.get("actual_quantity", "")),
+            remarks="删除盘点项"
+        )
+
+        success = StocktakeItemDB.delete(item_id)
+        if not success:
+            raise OperationError("删除失败")
+
+        return True, "盘点项删除成功"
+
+    def import_items_from_csv(self, order_id: int,
+                          csv_rows: List[Dict]) -> Tuple[int, str]:
+        self._check_permission("import_stocktake")
+
+        order = StocktakeOrderDB.get_by_id(order_id)
+        if not order:
+            raise OperationError("盘点单不存在")
+        if order["status"] != "draft":
+            raise OperationError("只能在草稿状态下导入盘点项")
+
+        if not csv_rows:
+            raise OperationError("导入数据为空")
+
+        items = []
+        errors = []
+
+        for row_num, row in enumerate(csv_rows, start=1):
+            reagent_name = row.get("试剂名称", "").strip()
+            batch_number = row.get("批号", "").strip()
+            actual_quantity_str = row.get("实盘数量", "").strip()
+            storage_location = row.get("存放位置", "").strip()
+            unit = row.get("单位", "").strip()
+            diff_reason = row.get("差异原因", "").strip()
+
+            if not reagent_name or not batch_number:
+                errors.append(f"第 {row_num} 行：试剂名称和批号不能为空")
+                continue
+
+            try:
+                actual_quantity = int(actual_quantity_str) if actual_quantity_str else 0
+            except ValueError:
+                errors.append(f"第 {row_num} 行：实盘数量必须是整数")
+                continue
+
+            if actual_quantity < 0:
+                errors.append(f"第 {row_num} 行：实盘数量不能为负数")
+                continue
+
+            reagent = ReagentDB.get_by_name_and_batch(reagent_name, batch_number)
+
+            expected_quantity = 0
+            conflict_type = "none"
+            reagent_id = None
+            snapshot_before = ""
+            expiration_date = None
+            low_stock_threshold = 10
+
+            if reagent:
+                expected_quantity = reagent["quantity"]
+                reagent_id = reagent["id"]
+                snapshot_before = json.dumps(reagent, ensure_ascii=False)
+                expiration_date = reagent.get("expiration_date")
+                low_stock_threshold = reagent["low_stock_threshold"]
+
+                if ReagentDB.is_expired(reagent["id"]):
+                    conflict_type = "expired"
+                elif reagent["quantity"] <= reagent["low_stock_threshold"]:
+                    conflict_type = "low_stock"
+            else:
+                conflict_type = "batch_not_found"
+
+            items.append({
+                "reagent_name": reagent_name,
+                "batch_number": batch_number,
+                "storage_location": storage_location,
+                "expected_quantity": expected_quantity,
+                "actual_quantity": actual_quantity,
+                "unit": unit,
+                "expiration_date": expiration_date,
+                "low_stock_threshold": low_stock_threshold,
+                "reagent_id": reagent_id,
+                "diff_reason": diff_reason,
+                "conflict_type": conflict_type,
+                "snapshot_before": snapshot_before
+            })
+
+        if errors:
+            raise OperationError("\n".join(errors))
+
+        if not items:
+            raise OperationError("没有有效的导入数据")
+
+        item_ids = StocktakeItemDB.bulk_create(order_id, items)
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="import_items",
+            order_id=order_id,
+            remarks=f"CSV导入：{len(items)} 条"
+        )
+
+        return len(item_ids), f"成功导入 {len(item_ids)} 条盘点项"
+
+    def confirm_item(self, item_id: int,
+                     skip: bool = False) -> Tuple[bool, str]:
+        self._check_permission("confirm_stocktake")
+
+        item = StocktakeItemDB.get_by_id(item_id)
+        if not item:
+            raise OperationError("盘点项不存在")
+
+        order = StocktakeOrderDB.get_by_id(item["order_id"])
+        if not order or order["status"] != "draft":
+            raise OperationError("只能在草稿状态下确认盘点项")
+
+        if item["process_status"] == "confirmed":
+            return False, "该盘点项已确认"
+
+        process_status = "skipped" if skip else "confirmed"
+
+        success = StocktakeItemDB.update(
+            item_id,
+            process_status=process_status
+        )
+
+        if not success:
+            raise OperationError("确认失败")
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="confirm_item",
+            order_id=item["order_id"],
+            item_id=item_id,
+            reagent_name=item["reagent_name"],
+            batch_number=item["batch_number"],
+            old_value=item["expected_quantity"],
+            new_value=item["actual_quantity"],
+            diff_reason=item.get("diff_reason", "") if not skip else "跳过",
+            remarks="跳过盘点项" if skip else "确认盘点项"
+        )
+
+        return True, f"盘点项已{process_status}"
+
+    def confirm_batch(self, item_ids: List[int],
+                   skip_all_pending: bool = False,
+                   skip: bool = False) -> Tuple[int, str]:
+        self._check_permission("confirm_stocktake")
+
+        if not item_ids and not skip_all_pending:
+            raise OperationError("请选择要确认的盘点项")
+
+        count = 0
+        errors = []
+
+        if skip_all_pending:
+            if item_ids:
+                first_item = StocktakeItemDB.get_by_id(item_ids[0])
+                if first_item:
+                    pending_items = StocktakeItemDB.get_pending_items(first_item["order_id"])
+                    item_ids = [item["id"] for item in pending_items]
+            else:
+                raise OperationError("无法确定盘点单ID")
+
+        for item_id in item_ids:
+            try:
+                success, _ = self.confirm_item(item_id, skip=skip)
+                if success:
+                    count += 1
+            except Exception as e:
+                errors.append(f"ID {item_id}: {str(e)}")
+
+        if errors:
+            raise OperationError("\n".join(errors))
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="confirm_batch",
+            remarks=f"批量确认：{count} 条"
+        )
+
+        return count, f"成功处理 {count} 条盘点项"
+
+    def write_back_to_inventory(self, order_id: int,
+                              item_ids: List[int] = None,
+                              write_all_confirmed: bool = False) -> Tuple[int, str]:
+        self._check_permission("write_back_stocktake")
+
+        order = StocktakeOrderDB.get_by_id(order_id)
+        if not order:
+            raise OperationError("盘点单不存在")
+        if order["status"] != "draft":
+            raise OperationError("只能在草稿状态下写回库存")
+
+        if write_all_confirmed:
+            items = StocktakeItemDB.get_by_order_id(
+                order_id, {"process_status": "confirmed"}
+            )
+            items = [item for item in items if item["diff_quantity"] != 0]
+        elif item_ids:
+            items = [StocktakeItemDB.get_by_id(iid) for iid in item_ids]
+            items = [item for item in items if item]
+        else:
+            raise OperationError("请选择要写回的盘点项")
+
+        if not items:
+            raise OperationError("没有可写回的盘点项，请先确认盘点项")
+
+        count = 0
+        errors = []
+
+        for item in items:
+            if not item:
+                continue
+            if item["process_status"] != "confirmed":
+                errors.append(
+                    f"{item['reagent_name']} ({item['batch_number']})：状态不是已确认，跳过"
+                )
+                continue
+            if item["diff_quantity"] == 0:
+                continue
+            if not item["reagent_id"]:
+                errors.append(
+                    f"{item['reagent_name']} ({item['batch_number']})：批号不存在，无法写回"
+                )
+                continue
+
+            try:
+                reagent = ReagentDB.get_by_id(item["reagent_id"])
+                if not reagent:
+                    errors.append(
+                        f"{item['reagent_name']} ({item['batch_number']})：试剂不存在"
+                    )
+                    continue
+
+                quantity_change = item["actual_quantity"] - item["expected_quantity"]
+
+                if quantity_change != 0:
+                    snapshot_before = json.dumps(reagent, ensure_ascii=False)
+
+                    success = ReagentDB.update_quantity(
+                        item["reagent_id"], quantity_change
+                    )
+
+                    if not success:
+                        errors.append(
+                            f"{item['reagent_name']} ({item['batch_number']})：库存更新失败"
+                        )
+                        continue
+
+                    reagent_after = ReagentDB.get_by_id(item["reagent_id"])
+                    snapshot_after = json.dumps(reagent_after, ensure_ascii=False)
+
+                    StocktakeItemDB.update(
+                        item["id"],
+                        snapshot_after=snapshot_after
+                    )
+
+                    diff_remark = item.get("diff_reason", "") or "盘点调整"
+
+                    OperationDB.create(
+                        operation_type="stocktake",
+                        reagent_id=item["reagent_id"],
+                        quantity=quantity_change,
+                        operator_id=self.auth.current_user["id"],
+                        status="completed",
+                        remarks=f"盘点调整：{diff_remark}",
+                        revertable=1,
+                        snapshot_before=snapshot_before,
+                        snapshot_after=snapshot_after
+                    )
+
+                    LedgerDB.create(
+                        reagent_id=item["reagent_id"],
+                        reagent_name=item["reagent_name"],
+                        batch_number=item["batch_number"],
+                        operation_type="stocktake",
+                        change_quantity=quantity_change,
+                        balance_quantity=reagent_after["quantity"],
+                        operator=self.auth.current_user["display_name"],
+                        remarks=diff_remark
+                    )
+
+                    StocktakeLogDB.create(
+                        operator_id=self.auth.current_user["id"],
+                        operator_name=self.auth.current_user["display_name"],
+                        operation_type="write_back",
+                        order_id=order_id,
+                        item_id=item["id"],
+                        reagent_name=item["reagent_name"],
+                        batch_number=item["batch_number"],
+                        old_value=str(item["expected_quantity"]),
+                        new_value=str(item["actual_quantity"]),
+                        diff_reason=item.get("diff_reason", ""),
+                        remarks="写回库存"
+                    )
+
+                    count += 1
+            except Exception as e:
+                errors.append(
+                    f"{item['reagent_name']} ({item['batch_number']}): {str(e)}"
+                )
+
+        if errors:
+            raise OperationError("\n".join(errors))
+
+        StocktakeOrderDB.update_status(order_id, "confirmed")
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="write_back",
+            order_id=order_id,
+            remarks=f"写回完成，盘点单已确认"
+        )
+
+        return count, f"成功写回 {count} 条差异到库存"
+
+    def cancel_order(self, order_id: int) -> Tuple[bool, str]:
+        self._check_permission("cancel_stocktake_order")
+
+        order = StocktakeOrderDB.get_by_id(order_id)
+        if not order:
+            raise OperationError("盘点单不存在")
+
+        if order["status"] == "cancelled":
+            return False, "盘点单已取消"
+
+        if order["status"] == "confirmed":
+            raise OperationError("已确认的盘点单无法取消")
+
+        success = StocktakeOrderDB.update_status(order_id, "cancelled")
+        if not success:
+            raise OperationError("取消失败")
+
+        StocktakeLogDB.create(
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            operation_type="cancel_order",
+            order_id=order_id,
+            remarks=f"取消盘点单：{order['title']}"
+        )
+
+        return True, "盘点单已取消"
+
+    def get_logs(self, filters: Dict = None) -> List[Dict]:
+        self._check_permission("view_stocktake")
+        return StocktakeLogDB.get_all(filters)

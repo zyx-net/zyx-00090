@@ -7,8 +7,10 @@ import sys
 from database import init_database, DB_PATH
 from auth import (AuthManager, ROLE_DISPLAY, OPERATION_TYPE_DISPLAY,
                   STATUS_DISPLAY, RESERVATION_OPERATION_DISPLAY,
-                  RESERVATION_STATUS_DISPLAY)
-from business import ReagentManager, OperationError
+                  RESERVATION_STATUS_DISPLAY, STOCKTAKE_ORDER_STATUS_DISPLAY,
+                  STOCKTAKE_PROCESS_STATUS_DISPLAY, STOCKTAKE_CONFLICT_TYPE_DISPLAY,
+                  STOCKTAKE_OPERATION_TYPE_DISPLAY)
+from business import ReagentManager, OperationError, StocktakeManager
 from csv_utils import CSVManager
 
 
@@ -24,12 +26,15 @@ class ReagentManagementApp:
         self.auth = AuthManager()
         self.manager = ReagentManager(self.auth)
         self.csv_manager = CSVManager(self.auth)
+        self.stocktake_manager = StocktakeManager(self.auth)
 
         self.current_tab = None
         self.selected_reagent_id = None
         self.selected_approval_id = None
         self.selected_reservation_id = None
         self.selected_reservation_log_id = None
+        self.selected_stocktake_order_id = None
+        self.selected_stocktake_item_ids = []
 
         self._current_preview_hash = None
         self._current_preview_result = None
@@ -124,6 +129,7 @@ class ReagentManagementApp:
         self.tab_reservation_logs = ttk.Frame(self.notebook)
         self.tab_ledger = ttk.Frame(self.notebook)
         self.tab_import_export = ttk.Frame(self.notebook)
+        self.tab_stocktake = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_inventory, text='库存管理')
         self.notebook.add(self.tab_reservation, text='预约管理')
@@ -133,6 +139,7 @@ class ReagentManagementApp:
         self.notebook.add(self.tab_reservation_logs, text='预约日志')
         self.notebook.add(self.tab_ledger, text='库存台账')
         self.notebook.add(self.tab_import_export, text='导入导出')
+        self.notebook.add(self.tab_stocktake, text='试剂盘点')
 
         status_bar = ttk.Frame(main_frame)
         status_bar.pack(fill='x', side='bottom', pady=(10, 0))
@@ -153,6 +160,7 @@ class ReagentManagementApp:
         self.setup_reservation_logs_tab()
         self.setup_ledger_tab()
         self.setup_import_export_tab()
+        self.setup_stocktake_tab()
 
         self.notebook.bind('<<NotebookTabChanged>>', self.on_tab_changed)
 
@@ -181,6 +189,8 @@ class ReagentManagementApp:
             self.refresh_reservation_logs()
         elif tab_text == '库存台账':
             self.refresh_ledger()
+        elif tab_text == '试剂盘点':
+            self.refresh_stocktake_orders()
 
     def set_status(self, message: str):
         self.status_var.set(message)
@@ -3036,6 +3046,883 @@ class ReagentManagementApp:
                         self.import_status_var.set(f"↩️ 方案：{plan['plan']['batch_no']}（已撤销）")
             else:
                 self.import_status_var.set("请点击\"创建导入方案\"生成预览方案")
+
+
+    def setup_stocktake_tab(self):
+        frame = self.tab_stocktake
+
+        if not self.auth.has_permission("view_stocktake"):
+            ttk.Label(frame, text="当前角色无盘点查看权限", font=('Microsoft YaHei', 14), foreground='gray').pack(pady=50)
+            return
+
+        main_paned = ttk.PanedWindow(frame, orient='horizontal')
+        main_paned.pack(fill='both', expand=True, padx=10, pady=10)
+
+        left_frame = ttk.Frame(main_paned)
+        main_paned.add(left_frame, weight=1)
+
+        right_paned = ttk.PanedWindow(main_paned, orient='vertical')
+        main_paned.add(right_paned, weight=3)
+
+        items_frame = ttk.Frame(right_paned)
+        right_paned.add(items_frame, weight=3)
+
+        logs_frame = ttk.Frame(right_paned)
+        right_paned.add(logs_frame, weight=1)
+
+        self._setup_stocktake_orders_list(left_frame)
+        self._setup_stocktake_items_list(items_frame)
+        self._setup_stocktake_logs_list(logs_frame)
+
+    def _setup_stocktake_orders_list(self, parent):
+        filter_frame = ttk.LabelFrame(parent, text="盘点单筛选", padding=10)
+        filter_frame.pack(fill='x', pady=5)
+
+        ttk.Label(filter_frame, text="单号：").grid(row=0, column=0, padx=2, pady=2)
+        self.stk_filter_order_no = ttk.Entry(filter_frame, width=15)
+        self.stk_filter_order_no.grid(row=0, column=1, padx=2, pady=2)
+
+        ttk.Label(filter_frame, text="标题：").grid(row=0, column=2, padx=2, pady=2)
+        self.stk_filter_title = ttk.Entry(filter_frame, width=15)
+        self.stk_filter_title.grid(row=0, column=3, padx=2, pady=2)
+
+        ttk.Label(filter_frame, text="状态：").grid(row=1, column=0, padx=2, pady=2)
+        self.stk_filter_status = ttk.Combobox(filter_frame, values=["全部", "草稿", "已确认", "已取消"], state='readonly', width=10)
+        self.stk_filter_status.grid(row=1, column=1, padx=2, pady=2)
+        self.stk_filter_status.current(0)
+
+        btn_row = ttk.Frame(filter_frame)
+        btn_row.grid(row=1, column=2, columnspan=3, pady=2)
+        ttk.Button(btn_row, text="查询", command=self.refresh_stocktake_orders).pack(side='left', padx=2)
+        ttk.Button(btn_row, text="重置", command=self._reset_stocktake_filters).pack(side='left', padx=2)
+
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill='x', pady=5)
+
+        if self.auth.has_permission("create_stocktake_order"):
+            ttk.Button(btn_frame, text="新建盘点单", command=self._create_stocktake_order_dialog).pack(side='left', padx=2)
+        if self.auth.has_permission("export_stocktake"):
+            ttk.Button(btn_frame, text="导出盘点单", command=self._export_stocktake_order).pack(side='left', padx=2)
+            ttk.Button(btn_frame, text="导出日志", command=self._export_stocktake_logs).pack(side='left', padx=2)
+
+        list_frame = ttk.LabelFrame(parent, text="盘点单列表", padding=5)
+        list_frame.pack(fill='both', expand=True)
+
+        self.stocktake_orders_tree = ttk.Treeview(list_frame, columns=(
+            "order_no", "title", "status", "total", "confirmed", "operator", "created_at"
+        ), show='headings')
+
+        orders_headings = [
+            ("order_no", "单号", 120),
+            ("title", "标题", 120),
+            ("status", "状态", 60),
+            ("total", "总项", 50),
+            ("confirmed", "已确认", 60),
+            ("operator", "操作人", 70),
+            ("created_at", "创建时间", 130)
+        ]
+        for col, text, width in orders_headings:
+            self.stocktake_orders_tree.heading(col, text=text)
+            self.stocktake_orders_tree.column(col, width=width, anchor='center')
+
+        orders_scroll = ttk.Scrollbar(list_frame, orient='vertical', command=self.stocktake_orders_tree.yview)
+        self.stocktake_orders_tree.configure(yscrollcommand=orders_scroll.set)
+        self.stocktake_orders_tree.pack(side='left', fill='both', expand=True)
+        orders_scroll.pack(side='right', fill='y')
+
+        self.stocktake_orders_tree.bind('<<TreeviewSelect>>', self._on_stocktake_order_select)
+        self.stocktake_orders_tree.bind('<Double-1>', self._show_stocktake_order_detail)
+
+    def _setup_stocktake_items_list(self, parent):
+        filter_frame = ttk.LabelFrame(parent, text="盘点项筛选", padding=10)
+        filter_frame.pack(fill='x', pady=5)
+
+        ttk.Label(filter_frame, text="试剂名：").grid(row=0, column=0, padx=2, pady=2)
+        self.stk_filter_name = ttk.Entry(filter_frame, width=12)
+        self.stk_filter_name.grid(row=0, column=1, padx=2, pady=2)
+
+        ttk.Label(filter_frame, text="批号：").grid(row=0, column=2, padx=2, pady=2)
+        self.stk_filter_batch = ttk.Entry(filter_frame, width=12)
+        self.stk_filter_batch.grid(row=0, column=3, padx=2, pady=2)
+
+        ttk.Label(filter_frame, text="位置：").grid(row=0, column=4, padx=2, pady=2)
+        self.stk_filter_location = ttk.Entry(filter_frame, width=12)
+        self.stk_filter_location.grid(row=0, column=5, padx=2, pady=2)
+
+        ttk.Label(filter_frame, text="状态：").grid(row=1, column=0, padx=2, pady=2)
+        self.stk_filter_process_status = ttk.Combobox(filter_frame, values=["全部", "待确认", "已确认", "已跳过"], state='readonly', width=10)
+        self.stk_filter_process_status.grid(row=1, column=1, padx=2, pady=2)
+        self.stk_filter_process_status.current(0)
+
+        ttk.Label(filter_frame, text="冲突：").grid(row=1, column=2, padx=2, pady=2)
+        self.stk_filter_conflict = ttk.Combobox(filter_frame, values=["全部", "无冲突", "已过期", "低库存", "批号不存在"], state='readonly', width=10)
+        self.stk_filter_conflict.grid(row=1, column=3, padx=2, pady=2)
+        self.stk_filter_conflict.current(0)
+
+        ttk.Label(filter_frame, text="差异：").grid(row=1, column=4, padx=2, pady=2)
+        self.stk_filter_diff = ttk.Combobox(filter_frame, values=["全部", "有差异", "无差异"], state='readonly', width=10)
+        self.stk_filter_diff.grid(row=1, column=5, padx=2, pady=2)
+        self.stk_filter_diff.current(0)
+
+        btn_row = ttk.Frame(filter_frame)
+        btn_row.grid(row=0, column=6, rowspan=2, padx=5)
+        ttk.Button(btn_row, text="查询", command=self.refresh_stocktake_items).pack(side='left', padx=2)
+        ttk.Button(btn_row, text="重置", command=self._reset_stocktake_item_filters).pack(side='left', padx=2)
+
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill='x', pady=5)
+
+        if self.auth.has_permission("edit_stocktake_item"):
+            ttk.Button(btn_frame, text="添加盘点项", command=self._add_stocktake_item_dialog).pack(side='left', padx=2)
+            ttk.Button(btn_frame, text="导入CSV", command=self._import_stocktake_csv).pack(side='left', padx=2)
+            ttk.Button(btn_frame, text="编辑", command=self._edit_stocktake_item_dialog).pack(side='left', padx=2)
+            ttk.Button(btn_frame, text="删除", command=self._delete_stocktake_item).pack(side='left', padx=2)
+
+        if self.auth.has_permission("confirm_stocktake"):
+            ttk.Separator(btn_frame, orient='vertical').pack(side='left', fill='y', padx=5)
+            ttk.Button(btn_frame, text="确认选中", command=self._confirm_selected_items).pack(side='left', padx=2)
+            ttk.Button(btn_frame, text="跳过选中", command=lambda: self._confirm_selected_items(skip=True)).pack(side='left', padx=2)
+            ttk.Button(btn_frame, text="确认全部待确认", command=lambda: self._confirm_all_pending()).pack(side='left', padx=2)
+
+        if self.auth.has_permission("write_back_stocktake"):
+            ttk.Separator(btn_frame, orient='vertical').pack(side='left', fill='y', padx=5)
+            ttk.Button(btn_frame, text="写回选中差异", command=self._write_back_selected).pack(side='left', padx=2)
+            ttk.Button(btn_frame, text="写回全部已确认", command=self._write_back_all_confirmed).pack(side='left', padx=2)
+
+        if self.auth.has_permission("cancel_stocktake_order"):
+            ttk.Separator(btn_frame, orient='vertical').pack(side='left', fill='y', padx=5)
+            ttk.Button(btn_frame, text="取消盘点单", command=self._cancel_stocktake_order).pack(side='left', padx=2)
+
+        tree_frame = ttk.LabelFrame(parent, text="盘点明细", padding=5)
+        tree_frame.pack(fill='both', expand=True)
+
+        self.stocktake_items_tree = ttk.Treeview(tree_frame, columns=(
+            "id", "name", "batch", "location", "expected", "actual", "diff", "unit",
+            "expiration", "conflict", "status", "reason"
+        ), show='headings', selectmode='extended')
+
+        items_headings = [
+            ("id", "ID", 50),
+            ("name", "试剂名称", 120),
+            ("batch", "批号", 100),
+            ("location", "存放位置", 100),
+            ("expected", "账面数", 70),
+            ("actual", "实盘数", 70),
+            ("diff", "差异数", 70),
+            ("unit", "单位", 50),
+            ("expiration", "过期日期", 90),
+            ("conflict", "冲突类型", 90),
+            ("status", "处理状态", 80),
+            ("reason", "差异原因", 150)
+        ]
+        for col, text, width in items_headings:
+            self.stocktake_items_tree.heading(col, text=text)
+            self.stocktake_items_tree.column(col, width=width, anchor='center')
+
+        items_scroll = ttk.Scrollbar(tree_frame, orient='vertical', command=self.stocktake_items_tree.yview)
+        self.stocktake_items_tree.configure(yscrollcommand=items_scroll.set)
+        self.stocktake_items_tree.pack(side='left', fill='both', expand=True)
+        items_scroll.pack(side='right', fill='y')
+
+        self.stocktake_items_tree.bind('<<TreeviewSelect>>', self._on_stocktake_item_select)
+        self.stocktake_items_tree.bind('<Double-1>', self._edit_stocktake_item_dialog)
+
+    def _setup_stocktake_logs_list(self, parent):
+        log_frame = ttk.LabelFrame(parent, text="操作日志", padding=5)
+        log_frame.pack(fill='both', expand=True)
+
+        self.stocktake_logs_tree = ttk.Treeview(log_frame, columns=(
+            "time", "operator", "op_type", "reagent", "batch", "old", "new", "reason", "remarks"
+        ), show='headings')
+
+        logs_headings = [
+            ("time", "操作时间", 130),
+            ("operator", "操作人", 70),
+            ("op_type", "操作类型", 90),
+            ("reagent", "试剂名称", 100),
+            ("batch", "批号", 90),
+            ("old", "原值", 70),
+            ("new", "新值", 70),
+            ("reason", "差异原因", 120),
+            ("remarks", "备注", 150)
+        ]
+        for col, text, width in logs_headings:
+            self.stocktake_logs_tree.heading(col, text=text)
+            self.stocktake_logs_tree.column(col, width=width, anchor='w')
+
+        logs_scroll = ttk.Scrollbar(log_frame, orient='vertical', command=self.stocktake_logs_tree.yview)
+        self.stocktake_logs_tree.configure(yscrollcommand=logs_scroll.set)
+        self.stocktake_logs_tree.pack(side='left', fill='both', expand=True)
+        logs_scroll.pack(side='right', fill='y')
+
+    def _reset_stocktake_filters(self):
+        self.stk_filter_order_no.delete(0, 'end')
+        self.stk_filter_title.delete(0, 'end')
+        self.stk_filter_status.current(0)
+        self.refresh_stocktake_orders()
+
+    def _reset_stocktake_item_filters(self):
+        self.stk_filter_name.delete(0, 'end')
+        self.stk_filter_batch.delete(0, 'end')
+        self.stk_filter_location.delete(0, 'end')
+        self.stk_filter_process_status.current(0)
+        self.stk_filter_conflict.current(0)
+        self.stk_filter_diff.current(0)
+        self.refresh_stocktake_items()
+
+    def _get_stocktake_order_filters(self):
+        filters = {}
+        order_no = self.stk_filter_order_no.get().strip()
+        if order_no:
+            filters["order_no"] = order_no
+        title = self.stk_filter_title.get().strip()
+        if title:
+            filters["title"] = title
+        status_val = self.stk_filter_status.get()
+        status_map = {"草稿": "draft", "已确认": "confirmed", "已取消": "cancelled"}
+        if status_val in status_map:
+            filters["status"] = status_map[status_val]
+        return filters
+
+    def _get_stocktake_item_filters(self):
+        filters = {}
+        name = self.stk_filter_name.get().strip()
+        if name:
+            filters["reagent_name"] = name
+        batch = self.stk_filter_batch.get().strip()
+        if batch:
+            filters["batch_number"] = batch
+        location = self.stk_filter_location.get().strip()
+        if location:
+            filters["storage_location"] = location
+        process_status_val = self.stk_filter_process_status.get()
+        process_status_map = {"待确认": "pending", "已确认": "confirmed", "已跳过": "skipped"}
+        if process_status_val in process_status_map:
+            filters["process_status"] = process_status_map[process_status_val]
+        conflict_val = self.stk_filter_conflict.get()
+        conflict_map = {"无冲突": "none", "已过期": "expired", "低库存": "low_stock", "批号不存在": "batch_not_found"}
+        if conflict_val in conflict_map:
+            filters["conflict_type"] = conflict_map[conflict_val]
+        diff_val = self.stk_filter_diff.get()
+        if diff_val == "有差异":
+            filters["has_diff"] = True
+        elif diff_val == "无差异":
+            filters["has_diff"] = False
+        return filters
+
+    def refresh_stocktake_orders(self):
+        for item in self.stocktake_orders_tree.get_children():
+            self.stocktake_orders_tree.delete(item)
+
+        try:
+            filters = self._get_stocktake_order_filters()
+            orders = self.stocktake_manager.get_orders(filters)
+
+            for order in orders:
+                status_display = STOCKTAKE_ORDER_STATUS_DISPLAY.get(order["status"], order["status"])
+                tags = ()
+                if order["status"] == "draft":
+                    tags = ('draft',)
+                elif order["status"] == "confirmed":
+                    tags = ('confirmed',)
+                elif order["status"] == "cancelled":
+                    tags = ('cancelled',)
+
+                self.stocktake_orders_tree.insert('', 'end', iid=str(order["id"]), values=(
+                    order["order_no"], order["title"], status_display,
+                    order["total_items"], order["confirmed_items"],
+                    order["operator_name"], order["created_at"]
+                ), tags=tags)
+
+            self.stocktake_orders_tree.tag_configure('draft', background='#fff3cd')
+            self.stocktake_orders_tree.tag_configure('confirmed', background='#d4edda')
+            self.stocktake_orders_tree.tag_configure('cancelled', background='#e2e3e5')
+
+            self.set_status(f"查询到 {len(orders)} 条盘点单")
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def refresh_stocktake_items(self):
+        for item in self.stocktake_items_tree.get_children():
+            self.stocktake_items_tree.delete(item)
+
+        if not self.selected_stocktake_order_id:
+            return
+
+        try:
+            filters = self._get_stocktake_item_filters()
+            items = self.stocktake_manager.get_items(self.selected_stocktake_order_id, filters)
+
+            for item in items:
+                diff = item["diff_quantity"]
+                diff_str = f"+{diff}" if diff > 0 else str(diff)
+                conflict_display = STOCKTAKE_CONFLICT_TYPE_DISPLAY.get(item.get("conflict_type", "none"), item.get("conflict_type", "none"))
+                status_display = STOCKTAKE_PROCESS_STATUS_DISPLAY.get(item.get("process_status", "pending"), item.get("process_status", "pending"))
+                exp_date = item.get("expiration_date") or "-"
+
+                tags = ()
+                if item.get("conflict_type") != "none":
+                    tags = ('conflict',)
+                elif item["process_status"] == "confirmed":
+                    tags = ('confirmed',)
+                elif item["process_status"] == "skipped":
+                    tags = ('skipped',)
+                elif diff != 0:
+                    tags = ('has_diff',)
+
+                self.stocktake_items_tree.insert('', 'end', iid=str(item["id"]), values=(
+                    item["id"], item["reagent_name"], item["batch_number"],
+                    item.get("storage_location", "") or "-",
+                    item["expected_quantity"], item["actual_quantity"], diff_str,
+                    item.get("unit", "") or "-", exp_date,
+                    conflict_display, status_display,
+                    item.get("diff_reason", "") or "-"
+                ), tags=tags)
+
+            self.stocktake_items_tree.tag_configure('conflict', background='#ffeeba')
+            self.stocktake_items_tree.tag_configure('confirmed', background='#d4edda')
+            self.stocktake_items_tree.tag_configure('skipped', background='#e2e3e5')
+            self.stocktake_items_tree.tag_configure('has_diff', background='#fff3cd')
+
+            self.set_status(f"查询到 {len(items)} 条盘点项")
+            self.refresh_stocktake_logs()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def refresh_stocktake_logs(self):
+        for item in self.stocktake_logs_tree.get_children():
+            self.stocktake_logs_tree.delete(item)
+
+        if not self.selected_stocktake_order_id:
+            return
+
+        try:
+            logs = self.stocktake_manager.get_logs({"order_id": self.selected_stocktake_order_id})
+
+            for log in logs:
+                op_type_display = STOCKTAKE_OPERATION_TYPE_DISPLAY.get(log.get("operation_type", ""), log.get("operation_type", ""))
+                self.stocktake_logs_tree.insert('', 'end', values=(
+                    log.get("operation_time", ""), log.get("operator_name", ""),
+                    op_type_display, log.get("reagent_name", "") or "-",
+                    log.get("batch_number", "") or "-",
+                    log.get("old_value", "") or "-", log.get("new_value", "") or "-",
+                    log.get("diff_reason", "") or "-",
+                    log.get("remarks", "") or "-"
+                ))
+        except OperationError:
+            pass
+
+    def _on_stocktake_order_select(self, event):
+        selection = self.stocktake_orders_tree.selection()
+        if selection:
+            self.selected_stocktake_order_id = int(selection[0])
+            self.selected_stocktake_item_ids = []
+            self.refresh_stocktake_items()
+
+    def _on_stocktake_item_select(self, event):
+        selection = self.stocktake_items_tree.selection()
+        self.selected_stocktake_item_ids = [int(s) for s in selection]
+
+    def _create_stocktake_order_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("新建盘点单")
+        dialog.geometry("500x350")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text="新建盘点单", font=('Microsoft YaHei', 14, 'bold')).grid(row=0, column=0, columnspan=2, pady=(0, 20))
+
+        fields = {}
+        labels = [
+            ("盘点单标题 *", "title", True),
+            ("存放位置", "storage_location", False),
+            ("备注", "remarks", False)
+        ]
+
+        for i, (label, key, required) in enumerate(labels, start=1):
+            ttk.Label(frame, text=label).grid(row=i, column=0, sticky='e', padx=5, pady=8)
+            if key == "remarks":
+                entry = tk.Text(frame, width=35, height=3)
+            else:
+                entry = ttk.Entry(frame, width=35)
+            entry.grid(row=i, column=1, padx=5, pady=8)
+            fields[key] = entry
+
+        auto_fill_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="自动从当前库存填充盘点项", variable=auto_fill_var).grid(
+            row=len(labels)+1, column=0, columnspan=2, pady=10)
+
+        def do_create():
+            try:
+                title = fields["title"].get().strip() if hasattr(fields["title"], 'get') else fields["title"].get('1.0', 'end').strip()
+                if not title:
+                    messagebox.showwarning("提示", "请填写盘点单标题")
+                    return
+
+                storage_location = fields["storage_location"].get().strip()
+                remarks = fields["remarks"].get('1.0', 'end').strip() if hasattr(fields["remarks"], 'get') else ""
+
+                order_id, msg = self.stocktake_manager.create_order(
+                    title=title,
+                    storage_location=storage_location,
+                    remarks=remarks,
+                    auto_fill_from_inventory=auto_fill_var.get()
+                )
+                messagebox.showinfo("成功", msg)
+                self.refresh_stocktake_orders()
+                dialog.destroy()
+            except OperationError as e:
+                messagebox.showerror("错误", str(e))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=len(labels)+2, column=0, columnspan=2, pady=20)
+        ttk.Button(btn_frame, text="确 定", command=do_create, width=15).pack(side='left', padx=10)
+        ttk.Button(btn_frame, text="取 消", command=dialog.destroy, width=15).pack(side='left', padx=10)
+
+    def _show_stocktake_order_detail(self, event):
+        selection = self.stocktake_orders_tree.selection()
+        if not selection:
+            return
+
+        order = self.stocktake_manager.get_order_by_id(int(selection[0]))
+        if not order:
+            return
+
+        detail_window = tk.Toplevel(self.root)
+        detail_window.title(f"盘点单详情 - {order['order_no']}")
+        detail_window.geometry("500x450")
+        detail_window.transient(self.root)
+
+        frame = ttk.Frame(detail_window, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        status_display = STOCKTAKE_ORDER_STATUS_DISPLAY.get(order["status"], order["status"])
+
+        info = [
+            ("盘点单号", order["order_no"]),
+            ("标题", order["title"]),
+            ("状态", status_display),
+            ("存放位置", order.get("storage_location", "") or "-"),
+            ("总项数", str(order["total_items"])),
+            ("已确认项数", str(order["confirmed_items"])),
+            ("操作人", order["operator_name"]),
+            ("备注", order.get("remarks", "") or "-"),
+            ("创建时间", order["created_at"]),
+            ("更新时间", order["updated_at"]),
+            ("确认时间", order.get("confirmed_at") or "-")
+        ]
+
+        for i, (label, value) in enumerate(info):
+            ttk.Label(frame, text=f"{label}：", font=('Microsoft YaHei', 10, 'bold')).grid(row=i, column=0, sticky='e', padx=5, pady=5)
+            ttk.Label(frame, text=value, font=('Microsoft YaHei', 10)).grid(row=i, column=1, sticky='w', padx=5, pady=5)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=len(info), column=0, columnspan=2, pady=15)
+
+        if order["status"] == "draft" and self.auth.has_permission("export_stocktake"):
+            ttk.Button(btn_frame, text="导出盘点单", command=lambda: (detail_window.destroy(), self._export_stocktake_order())).pack(side='left', padx=5)
+        if order["status"] == "draft" and self.auth.has_permission("cancel_stocktake_order"):
+            ttk.Button(btn_frame, text="取消盘点单", command=lambda: (detail_window.destroy(), self._cancel_stocktake_order())).pack(side='left', padx=5)
+
+    def _add_stocktake_item_dialog(self):
+        if not self.selected_stocktake_order_id:
+            messagebox.showwarning("提示", "请先选择一个盘点单")
+            return
+
+        order = self.stocktake_manager.get_order_by_id(self.selected_stocktake_order_id)
+        if not order or order["status"] != "draft":
+            messagebox.showerror("错误", "只能在草稿状态下添加盘点项")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("添加盘点项")
+        dialog.geometry("450x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        fields = {}
+        labels = [
+            ("试剂名称 *", "reagent_name", True),
+            ("批号 *", "batch_number", True),
+            ("实盘数量 *", "actual_quantity", True),
+            ("单位", "unit", False),
+            ("存放位置", "storage_location", False),
+            ("差异原因", "diff_reason", False)
+        ]
+
+        for i, (label, key, required) in enumerate(labels):
+            ttk.Label(frame, text=label).grid(row=i, column=0, sticky='e', padx=5, pady=8)
+            if key == "diff_reason":
+                entry = tk.Text(frame, width=30, height=2)
+            else:
+                entry = ttk.Entry(frame, width=30)
+            entry.grid(row=i, column=1, padx=5, pady=8)
+            fields[key] = entry
+
+        def do_add():
+            try:
+                reagent_name = fields["reagent_name"].get().strip()
+                batch_number = fields["batch_number"].get().strip()
+                actual_qty_str = fields["actual_quantity"].get().strip()
+
+                if not reagent_name or not batch_number or not actual_qty_str:
+                    messagebox.showwarning("提示", "请填写所有必填项")
+                    return
+
+                try:
+                    actual_quantity = int(actual_qty_str)
+                except ValueError:
+                    messagebox.showerror("错误", "实盘数量必须是整数")
+                    return
+
+                unit = fields["unit"].get().strip()
+                storage_location = fields["storage_location"].get().strip()
+                diff_reason = fields["diff_reason"].get('1.0', 'end').strip() if hasattr(fields["diff_reason"], 'get') else ""
+
+                item_id, msg = self.stocktake_manager.add_item(
+                    order_id=self.selected_stocktake_order_id,
+                    reagent_name=reagent_name,
+                    batch_number=batch_number,
+                    actual_quantity=actual_quantity,
+                    storage_location=storage_location,
+                    unit=unit,
+                    diff_reason=diff_reason
+                )
+                messagebox.showinfo("成功", msg)
+                self.refresh_stocktake_items()
+                self.refresh_stocktake_orders()
+                dialog.destroy()
+            except OperationError as e:
+                messagebox.showerror("错误", str(e))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=len(labels), column=0, columnspan=2, pady=20)
+        ttk.Button(btn_frame, text="确 定", command=do_add, width=12).pack(side='left', padx=10)
+        ttk.Button(btn_frame, text="取 消", command=dialog.destroy, width=12).pack(side='left', padx=10)
+
+    def _edit_stocktake_item_dialog(self, event=None):
+        if not self.selected_stocktake_item_ids:
+            messagebox.showwarning("提示", "请先选择要编辑的盘点项")
+            return
+
+        item_id = self.selected_stocktake_item_ids[0]
+        item = StocktakeItemDB.get_by_id(item_id)
+        if not item:
+            messagebox.showerror("错误", "盘点项不存在")
+            return
+
+        order = self.stocktake_manager.get_order_by_id(item["order_id"])
+        if not order or order["status"] != "draft":
+            messagebox.showerror("错误", "只能在草稿状态下编辑盘点项")
+            return
+
+        if not self.auth.has_permission("edit_stocktake_item"):
+            messagebox.showerror("错误", "权限不足")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("编辑盘点项")
+        dialog.geometry("450x450")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text=f"试剂：{item['reagent_name']} ({item['batch_number']})",
+                  font=('Microsoft YaHei', 10, 'bold')).grid(row=0, column=0, columnspan=2, pady=10)
+        ttk.Label(frame, text=f"账面数：{item['expected_quantity']}").grid(row=1, column=0, columnspan=2, pady=5)
+
+        fields = {}
+        labels = [
+            ("实盘数量 *", "actual_quantity", True),
+            ("存放位置", "storage_location", False),
+            ("差异原因", "diff_reason", False)
+        ]
+
+        for i, (label, key, required) in enumerate(labels, start=2):
+            ttk.Label(frame, text=label).grid(row=i, column=0, sticky='e', padx=5, pady=8)
+            if key == "diff_reason":
+                entry = tk.Text(frame, width=30, height=3)
+                entry.insert('1.0', item.get(key, "") or "")
+            else:
+                entry = ttk.Entry(frame, width=30)
+                entry.insert(0, str(item.get(key, "")))
+            entry.grid(row=i, column=1, padx=5, pady=8)
+            fields[key] = entry
+
+        def do_edit():
+            try:
+                actual_qty_str = fields["actual_quantity"].get().strip()
+                if not actual_qty_str:
+                    messagebox.showwarning("提示", "请填写实盘数量")
+                    return
+
+                try:
+                    actual_quantity = int(actual_qty_str)
+                except ValueError:
+                    messagebox.showerror("错误", "实盘数量必须是整数")
+                    return
+
+                storage_location = fields["storage_location"].get().strip()
+                diff_reason = fields["diff_reason"].get('1.0', 'end').strip()
+
+                success, msg = self.stocktake_manager.update_item(
+                    item_id=item_id,
+                    actual_quantity=actual_quantity,
+                    storage_location=storage_location,
+                    diff_reason=diff_reason
+                )
+                messagebox.showinfo("成功", msg)
+                self.refresh_stocktake_items()
+                self.refresh_stocktake_logs()
+                dialog.destroy()
+            except OperationError as e:
+                messagebox.showerror("错误", str(e))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=len(labels)+2, column=0, columnspan=2, pady=20)
+        ttk.Button(btn_frame, text="确 定", command=do_edit, width=12).pack(side='left', padx=10)
+        ttk.Button(btn_frame, text="取 消", command=dialog.destroy, width=12).pack(side='left', padx=10)
+
+    def _delete_stocktake_item(self):
+        if not self.selected_stocktake_item_ids:
+            messagebox.showwarning("提示", "请先选择要删除的盘点项")
+            return
+
+        if not messagebox.askyesno("确认", f"确定要删除选中的 {len(self.selected_stocktake_item_ids)} 条盘点项吗？"):
+            return
+
+        try:
+            for item_id in self.selected_stocktake_item_ids:
+                self.stocktake_manager.delete_item(item_id)
+            messagebox.showinfo("成功", f"成功删除 {len(self.selected_stocktake_item_ids)} 条盘点项")
+            self.selected_stocktake_item_ids = []
+            self.refresh_stocktake_items()
+            self.refresh_stocktake_orders()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _import_stocktake_csv(self):
+        if not self.selected_stocktake_order_id:
+            messagebox.showwarning("提示", "请先选择一个盘点单")
+            return
+
+        order = self.stocktake_manager.get_order_by_id(self.selected_stocktake_order_id)
+        if not order or order["status"] != "draft":
+            messagebox.showerror("错误", "只能在草稿状态下导入盘点项")
+            return
+
+        filepath = filedialog.askopenfilename(
+            title="选择盘点CSV文件",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
+        )
+        if not filepath:
+            return
+
+        try:
+            csv_rows = self.csv_manager.parse_stocktake_csv(filepath)
+            count, msg = self.stocktake_manager.import_items_from_csv(
+                self.selected_stocktake_order_id, csv_rows
+            )
+            messagebox.showinfo("成功", msg)
+            self.refresh_stocktake_items()
+            self.refresh_stocktake_orders()
+            self.refresh_stocktake_logs()
+        except (ValueError, FileNotFoundError) as e:
+            messagebox.showerror("导入失败", str(e))
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _confirm_selected_items(self, skip: bool = False):
+        if not self.selected_stocktake_item_ids:
+            messagebox.showwarning("提示", "请先选择要确认的盘点项")
+            return
+
+        try:
+            count = 0
+            errors = []
+            for item_id in self.selected_stocktake_item_ids:
+                try:
+                    success, _ = self.stocktake_manager.confirm_item(item_id, skip=skip)
+                    if success:
+                        count += 1
+                except Exception as e:
+                    errors.append(f"ID {item_id}: {str(e)}")
+
+            if errors:
+                messagebox.showerror("部分失败", "\n".join(errors))
+
+            action = "跳过" if skip else "确认"
+            messagebox.showinfo("成功", f"成功{action} {count} 条盘点项")
+            self.refresh_stocktake_items()
+            self.refresh_stocktake_orders()
+            self.refresh_stocktake_logs()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _confirm_all_pending(self):
+        if not self.selected_stocktake_order_id:
+            messagebox.showwarning("提示", "请先选择一个盘点单")
+            return
+
+        pending_items = StocktakeItemDB.get_pending_items(self.selected_stocktake_order_id)
+        if not pending_items:
+            messagebox.showinfo("提示", "没有待确认的盘点项")
+            return
+
+        if not messagebox.askyesno("确认", f"确定要确认所有 {len(pending_items)} 条待确认的盘点项吗？"):
+            return
+
+        try:
+            count, msg = self.stocktake_manager.confirm_batch(
+                [item["id"] for item in pending_items],
+                skip_all_pending=True
+            )
+            messagebox.showinfo("成功", msg)
+            self.refresh_stocktake_items()
+            self.refresh_stocktake_orders()
+            self.refresh_stocktake_logs()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _write_back_selected(self):
+        if not self.selected_stocktake_order_id:
+            messagebox.showwarning("提示", "请先选择一个盘点单")
+            return
+
+        if not self.selected_stocktake_item_ids:
+            messagebox.showwarning("提示", "请先选择要写回的盘点项")
+            return
+
+        confirmed_items = [iid for iid in self.selected_stocktake_item_ids]
+        if not confirmed_items:
+            messagebox.showwarning("提示", "请先确认要写回的盘点项")
+            return
+
+        if not messagebox.askyesno("确认", f"确定要将选中的 {len(confirmed_items)} 条差异写回库存吗？\n此操作将更新库存数量。"):
+            return
+
+        try:
+            count, msg = self.stocktake_manager.write_back_to_inventory(
+                self.selected_stocktake_order_id,
+                item_ids=confirmed_items
+            )
+            messagebox.showinfo("成功", msg)
+            self.refresh_stocktake_items()
+            self.refresh_stocktake_orders()
+            self.refresh_stocktake_logs()
+            self.refresh_inventory()
+            self.refresh_history()
+            self.refresh_ledger()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _write_back_all_confirmed(self):
+        if not self.selected_stocktake_order_id:
+            messagebox.showwarning("提示", "请先选择一个盘点单")
+            return
+
+        items = self.stocktake_manager.get_items(
+            self.selected_stocktake_order_id,
+            {"process_status": "confirmed", "has_diff": True}
+        )
+        if not items:
+            messagebox.showinfo("提示", "没有已确认且有差异的盘点项")
+            return
+
+        if not messagebox.askyesno("确认", f"确定要将所有 {len(items)} 条已确认的差异写回库存吗？\n此操作将更新库存数量。"):
+            return
+
+        try:
+            count, msg = self.stocktake_manager.write_back_to_inventory(
+                self.selected_stocktake_order_id,
+                write_all_confirmed=True
+            )
+            messagebox.showinfo("成功", msg)
+            self.refresh_stocktake_items()
+            self.refresh_stocktake_orders()
+            self.refresh_stocktake_logs()
+            self.refresh_inventory()
+            self.refresh_history()
+            self.refresh_ledger()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _cancel_stocktake_order(self):
+        if not self.selected_stocktake_order_id:
+            messagebox.showwarning("提示", "请先选择一个盘点单")
+            return
+
+        order = self.stocktake_manager.get_order_by_id(self.selected_stocktake_order_id)
+        if not order:
+            return
+
+        if not messagebox.askyesno("确认", f"确定要取消盘点单「{order['title']}」吗？\n此操作不可恢复。"):
+            return
+
+        try:
+            success, msg = self.stocktake_manager.cancel_order(self.selected_stocktake_order_id)
+            messagebox.showinfo("成功", msg)
+            self.selected_stocktake_order_id = None
+            self.selected_stocktake_item_ids = []
+            self.refresh_stocktake_orders()
+            self.refresh_stocktake_items()
+            self.refresh_stocktake_logs()
+        except OperationError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _export_stocktake_order(self):
+        if not self.selected_stocktake_order_id:
+            messagebox.showwarning("提示", "请先选择一个盘点单")
+            return
+
+        order = self.stocktake_manager.get_order_by_id(self.selected_stocktake_order_id)
+        if not order:
+            return
+
+        default_name = f"盘点单_{order['order_no']}.csv"
+        filepath = filedialog.asksaveasfilename(
+            title="导出盘点单",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV 文件", "*.csv")]
+        )
+        if not filepath:
+            return
+
+        try:
+            count, msg = self.csv_manager.export_stocktake_order(
+                filepath, self.selected_stocktake_order_id, self.stocktake_manager
+            )
+            messagebox.showinfo("成功", msg)
+            self.refresh_stocktake_logs()
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败：{str(e)}")
+
+    def _export_stocktake_logs(self):
+        default_name = f"盘点日志_{datetime.now().strftime('%Y%m%d')}.csv"
+        filepath = filedialog.asksaveasfilename(
+            title="导出盘点日志",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV 文件", "*.csv")]
+        )
+        if not filepath:
+            return
+
+        try:
+            filters = {"order_id": self.selected_stocktake_order_id} if self.selected_stocktake_order_id else None
+            count, msg = self.csv_manager.export_stocktake_logs(filepath, filters)
+            messagebox.showinfo("成功", msg)
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败：{str(e)}")
 
 
 def main():

@@ -12,9 +12,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from database import (init_database, DB_PATH, ReagentDB, OperationDB, LedgerDB,
                        ReservationDB, ReservationLogDB, ReagentLockDB, close_db,
-                       ImportResultDB, ImportPlanDB, ImportPlanItemDB, ImportAuditLogDB)
+                       ImportResultDB, ImportPlanDB, ImportPlanItemDB, ImportAuditLogDB,
+                       StocktakeOrderDB, StocktakeItemDB, StocktakeLogDB)
 from auth import AuthManager
-from business import ReagentManager, OperationError
+from business import ReagentManager, OperationError, StocktakeManager
 from csv_utils import CSVManager
 
 
@@ -44,6 +45,7 @@ def run_tests():
     auth = AuthManager()
     manager = ReagentManager(auth)
     csv_mgr = CSVManager(auth)
+    stocktake_mgr = StocktakeManager(auth)
 
     passed = 0
     failed = 0
@@ -2158,7 +2160,7 @@ def run_tests():
             assert hasattr(app, 'items_tree'), "items_tree 处理明细表格应已创建"
 
             tab_count = len(app.notebook.tabs())
-            assert tab_count == 8, f"应创建8个标签页，实际{tab_count}个"
+            assert tab_count == 9, f"应创建9个标签页，实际{tab_count}个"
             test_passed("管理员登录后主界面构建成功，所有组件已初始化")
             passed += 1
 
@@ -3679,6 +3681,1001 @@ def run_tests():
         failed += 1
     except Exception as e:
         test_failed("文件变化检测", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # ============================================
+    # 以下为【试剂盘点】模块新增测试
+    # ============================================
+
+    # Test 45: 盘点单创建和基本操作
+    print("\n【测试 45】盘点单创建和基本操作测试")
+    try:
+        reset_database()
+        auth.login("admin")
+
+        order_id, msg = stocktake_mgr.create_order(
+            title="2025年第一季度盘点",
+            storage_location="试剂库A区",
+            remarks="季度例行盘点"
+        )
+        assert order_id > 0
+        assert "成功" in msg
+
+        order = stocktake_mgr.get_order_by_id(order_id)
+        assert order is not None
+        assert order["title"] == "2025年第一季度盘点"
+        assert order["status"] == "draft"
+        assert order["storage_location"] == "试剂库A区"
+        assert order["total_items"] == 0
+        assert order["confirmed_items"] == 0
+
+        orders = stocktake_mgr.get_orders()
+        assert len(orders) >= 1
+
+        test_passed("盘点单创建成功，状态和字段正确")
+        passed += 1
+
+        item_id, msg = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="盘点测试试剂A",
+            batch_number="STOCK-A-001",
+            actual_quantity=80,
+            unit="瓶",
+            storage_location="A-01",
+            diff_reason="测试添加"
+        )
+        assert item_id > 0
+
+        items = stocktake_mgr.get_items(order_id)
+        assert len(items) == 1
+        assert items[0]["reagent_name"] == "盘点测试试剂A"
+        assert items[0]["actual_quantity"] == 80
+        assert items[0]["process_status"] == "pending"
+
+        test_passed("盘点项添加成功，状态正确")
+        passed += 1
+
+        success, msg = stocktake_mgr.update_item(
+            item_id=item_id,
+            actual_quantity=85,
+            diff_reason="实际盘点后修正"
+        )
+        assert success
+
+        item = StocktakeItemDB.get_by_id(item_id)
+        assert item["actual_quantity"] == 85
+        assert item["diff_reason"] == "实际盘点后修正"
+
+        test_passed("盘点项更新成功，字段正确")
+        passed += 1
+
+        item2_id, _ = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="盘点测试试剂B",
+            batch_number="STOCK-B-001",
+            actual_quantity=50,
+            unit="瓶"
+        )
+        items = stocktake_mgr.get_items(order_id)
+        assert len(items) == 2
+
+        success, _ = stocktake_mgr.delete_item(item2_id)
+        assert success
+
+        items = stocktake_mgr.get_items(order_id)
+        assert len(items) == 1
+
+        test_passed("盘点项删除成功")
+        passed += 1
+
+    except AssertionError as e:
+        test_failed("盘点单创建和基本操作", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("盘点单创建和基本操作", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 46: CSV导入异常测试
+    print("\n【测试 46】CSV导入异常测试")
+    try:
+        auth.login("admin")
+
+        order_id, _ = stocktake_mgr.create_order(
+            title="导入测试盘点单",
+            storage_location="测试区"
+        )
+
+        missing_cols_path = os.path.join(os.path.dirname(DB_PATH), "test_missing_cols.csv")
+        with open(missing_cols_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号"])
+            writer.writerow(["测试试剂", "TEST-001"])
+
+        try:
+            csv_rows = csv_mgr.parse_stocktake_csv(missing_cols_path)
+            test_failed("CSV缺少必填列", "应该失败但成功了")
+            failed += 1
+        except ValueError as e:
+            if "缺少必填列" in str(e) or "实盘数量" in str(e):
+                test_passed("CSV缺少必填列时正确抛出异常")
+                passed += 1
+            else:
+                test_failed("CSV缺少必填列", f"异常信息不符：{e}")
+                failed += 1
+
+        invalid_qty_path = os.path.join(os.path.dirname(DB_PATH), "test_invalid_qty.csv")
+        with open(invalid_qty_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "实盘数量"])
+            writer.writerow(["测试试剂", "TEST-002", "不是数字"])
+
+        try:
+            csv_rows = csv_mgr.parse_stocktake_csv(invalid_qty_path)
+            count, msg = stocktake_mgr.import_items_from_csv(order_id, csv_rows)
+            test_failed("CSV数量非数字", "应该失败但成功了")
+            failed += 1
+        except ValueError as e:
+            if "第" in str(e) and "行" in str(e) and "整数" in str(e):
+                test_passed("CSV数量非数字时正确抛出异常，包含行号")
+                passed += 1
+            else:
+                test_failed("CSV数量非数字", f"异常信息不符：{e}")
+                failed += 1
+
+        nonexistent_path = os.path.join(os.path.dirname(DB_PATH), "nonexistent.csv")
+        try:
+            csv_mgr.parse_stocktake_csv(nonexistent_path)
+            test_failed("CSV文件不存在", "应该失败但成功了")
+            failed += 1
+        except FileNotFoundError:
+            test_passed("CSV文件不存在时正确抛出FileNotFoundError")
+            passed += 1
+
+        empty_path = os.path.join(os.path.dirname(DB_PATH), "test_empty.csv")
+        with open(empty_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "实盘数量"])
+
+        try:
+            csv_rows = csv_mgr.parse_stocktake_csv(empty_path)
+            count, msg = stocktake_mgr.import_items_from_csv(order_id, csv_rows)
+            test_failed("CSV空数据", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "导入数据为空" in str(e):
+                test_passed("CSV空数据时正确抛出异常")
+                passed += 1
+            else:
+                test_failed("CSV空数据", f"异常信息不符：{e}")
+                failed += 1
+
+        os.remove(missing_cols_path)
+        os.remove(invalid_qty_path)
+        os.remove(empty_path)
+
+    except AssertionError as e:
+        test_failed("CSV导入异常", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("CSV导入异常", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 47: 权限拦截测试
+    print("\n【测试 47】权限拦截测试")
+    try:
+        auth.login("admin")
+        order_id, _ = stocktake_mgr.create_order(
+            title="权限测试盘点单",
+            storage_location="测试区"
+        )
+        item_id, _ = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="权限测试试剂",
+            batch_number="PERM-001",
+            actual_quantity=100,
+            unit="瓶"
+        )
+
+        auth.login("lab_staff")
+
+        try:
+            stocktake_mgr.create_order(title="越权创建")
+            test_failed("普通用户创建盘点单", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "权限不足" in str(e):
+                test_passed("普通用户不能创建盘点单（权限校验正确）")
+                passed += 1
+            else:
+                test_failed("普通用户创建盘点单", f"异常信息不符：{e}")
+                failed += 1
+
+        try:
+            stocktake_mgr.add_item(order_id, "测试", "TEST", 10)
+            test_failed("普通用户添加盘点项", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "权限不足" in str(e):
+                test_passed("普通用户不能添加盘点项（权限校验正确）")
+                passed += 1
+            else:
+                test_failed("普通用户添加盘点项", f"异常信息不符：{e}")
+                failed += 1
+
+        try:
+            stocktake_mgr.confirm_item(item_id)
+            test_failed("普通用户确认盘点项", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "权限不足" in str(e):
+                test_passed("普通用户不能确认盘点项（权限校验正确）")
+                passed += 1
+            else:
+                test_failed("普通用户确认盘点项", f"异常信息不符：{e}")
+                failed += 1
+
+        try:
+            stocktake_mgr.write_back_to_inventory(order_id, write_all_confirmed=True)
+            test_failed("普通用户写回库存", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "权限不足" in str(e):
+                test_passed("普通用户不能写回库存（权限校验正确）")
+                passed += 1
+            else:
+                test_failed("普通用户写回库存", f"异常信息不符：{e}")
+                failed += 1
+
+        try:
+            stocktake_mgr.cancel_order(order_id)
+            test_failed("普通用户取消盘点单", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "权限不足" in str(e):
+                test_passed("普通用户不能取消盘点单（权限校验正确）")
+                passed += 1
+            else:
+                test_failed("普通用户取消盘点单", f"异常信息不符：{e}")
+                failed += 1
+
+        orders = stocktake_mgr.get_orders()
+        assert len(orders) >= 1
+        items = stocktake_mgr.get_items(order_id)
+        assert len(items) >= 1
+
+        test_passed("普通用户可以查看盘点单和盘点项（只读权限正确）")
+        passed += 1
+
+    except AssertionError as e:
+        test_failed("权限拦截", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("权限拦截", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 48: 冲突检测和确认测试
+    print("\n【测试 48】冲突检测和确认测试")
+    try:
+        auth.login("admin")
+        reset_database()
+
+        past_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        future_date = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+
+        expired_reagent_id, _ = manager.create_reagent(
+            "过期试剂", "EXPIRED-001", 100, "瓶",
+            expiration_date=past_date,
+            low_stock_threshold=50,
+            storage_condition="A-01"
+        )
+
+        low_stock_id, _ = manager.create_reagent(
+            "低库存试剂", "LOW-STOCK-001", 5, "瓶",
+            expiration_date=future_date,
+            low_stock_threshold=20,
+            storage_condition="A-02"
+        )
+
+        normal_id, _ = manager.create_reagent(
+            "正常试剂", "NORMAL-001", 50, "瓶",
+            expiration_date=future_date,
+            low_stock_threshold=10,
+            storage_condition="A-03"
+        )
+
+        order_id, _ = stocktake_mgr.create_order(
+            title="冲突测试盘点单",
+            storage_location="测试区",
+            auto_fill_from_inventory=False
+        )
+
+        expired_item_id, _ = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="过期试剂",
+            batch_number="EXPIRED-001",
+            actual_quantity=80,
+            storage_location="A-01",
+            unit="瓶"
+        )
+
+        low_stock_item_id, _ = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="低库存试剂",
+            batch_number="LOW-STOCK-001",
+            actual_quantity=3,
+            storage_location="A-02",
+            unit="瓶"
+        )
+
+        not_found_item_id, _ = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="不存在的试剂",
+            batch_number="NOT-FOUND-001",
+            actual_quantity=10,
+            unit="瓶"
+        )
+
+        normal_item_id, _ = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="正常试剂",
+            batch_number="NORMAL-001",
+            actual_quantity=60,
+            storage_location="A-03",
+            unit="瓶"
+        )
+
+        items = stocktake_mgr.get_items(order_id)
+
+        expired_item = next(i for i in items if i["batch_number"] == "EXPIRED-001")
+        assert expired_item["conflict_type"] == "expired"
+        assert expired_item["process_status"] == "pending"
+        assert expired_item["expected_quantity"] == 100
+        assert expired_item["actual_quantity"] == 80
+        assert expired_item["diff_quantity"] == -20
+
+        low_stock_item = next(i for i in items if i["batch_number"] == "LOW-STOCK-001")
+        assert low_stock_item["conflict_type"] == "low_stock"
+        assert low_stock_item["process_status"] == "pending"
+
+        not_found_item = next(i for i in items if i["batch_number"] == "NOT-FOUND-001")
+        assert not_found_item["conflict_type"] == "batch_not_found"
+        assert not_found_item["process_status"] == "pending"
+        assert not_found_item["expected_quantity"] == 0
+
+        normal_item = next(i for i in items if i["batch_number"] == "NORMAL-001")
+        assert normal_item["conflict_type"] == "none"
+        assert normal_item["process_status"] == "pending"
+
+        test_passed("冲突检测正确：已过期、低库存、批号不存在三类冲突均正确识别")
+        passed += 1
+
+        success, msg = stocktake_mgr.confirm_item(expired_item_id)
+        assert success
+        expired_item_after = StocktakeItemDB.get_by_id(expired_item_id)
+        assert expired_item_after["process_status"] == "confirmed"
+
+        test_passed("过期试剂冲突确认成功，状态改为已确认")
+        passed += 1
+
+        success, msg = stocktake_mgr.confirm_item(not_found_item_id, skip=True)
+        assert success
+        not_found_item_after = StocktakeItemDB.get_by_id(not_found_item_id)
+        assert not_found_item_after["process_status"] == "skipped"
+
+        test_passed("批号不存在冲突跳过成功，状态改为已跳过")
+        passed += 1
+
+        count, msg = stocktake_mgr.confirm_batch(
+            [low_stock_item_id, normal_item_id]
+        )
+        assert count == 2
+
+        low_stock_after = StocktakeItemDB.get_by_id(low_stock_item_id)
+        normal_after = StocktakeItemDB.get_by_id(normal_item_id)
+        assert low_stock_after["process_status"] == "confirmed"
+        assert normal_after["process_status"] == "confirmed"
+
+        test_passed("批量确认成功，多条记录状态同时更新")
+        passed += 1
+
+        logs = stocktake_mgr.get_logs({"order_id": order_id})
+        confirm_logs = [l for l in logs if l["operation_type"] == "confirm_item"]
+        assert len(confirm_logs) >= 2
+
+        for log in confirm_logs:
+            assert log["old_value"] is not None or log["old_value"] == ""
+            assert log["new_value"] is not None or log["new_value"] == ""
+            assert log["operator_id"] is not None
+            assert log["operation_time"] is not None
+
+        test_passed("确认操作日志记录完整，包含操作人、时间、原值、新值")
+        passed += 1
+
+    except AssertionError as e:
+        test_failed("冲突检测和确认", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("冲突检测和确认", str(e) if str(e) else "未知错误")
+        import traceback
+        traceback.print_exc()
+        failed += 1
+
+    # Test 49: 差异写回库存测试
+    print("\n【测试 49】差异写回库存测试")
+    try:
+        auth.login("admin")
+        reset_database()
+
+        future_date = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+
+        reagent1_id, _ = manager.create_reagent(
+            "写回测试试剂A", "WB-A-001", 100, "瓶",
+            expiration_date=future_date,
+            low_stock_threshold=10
+        )
+
+        reagent2_id, _ = manager.create_reagent(
+            "写回测试试剂B", "WB-B-001", 50, "瓶",
+            expiration_date=future_date,
+            low_stock_threshold=10
+        )
+
+        order_id, _ = stocktake_mgr.create_order(
+            title="写回测试盘点单",
+            storage_location="测试区"
+        )
+
+        item1_id, _ = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="写回测试试剂A",
+            batch_number="WB-A-001",
+            actual_quantity=120,
+            unit="瓶"
+        )
+
+        item2_id, _ = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="写回测试试剂B",
+            batch_number="WB-B-001",
+            actual_quantity=40,
+            unit="瓶"
+        )
+
+        stocktake_mgr.confirm_item(item1_id)
+        stocktake_mgr.confirm_item(item2_id)
+
+        count, msg = stocktake_mgr.write_back_to_inventory(
+            order_id, write_all_confirmed=True
+        )
+        assert count == 2
+
+        reagent1_after = ReagentDB.get_by_id(reagent1_id)
+        reagent2_after = ReagentDB.get_by_id(reagent2_id)
+
+        assert reagent1_after["quantity"] == 120
+        assert reagent2_after["quantity"] == 40
+
+        test_passed("差异写回库存成功，库存数量正确更新")
+        passed += 1
+
+        operations = OperationDB.get_all(100)
+        stocktake_ops = [op for op in operations if op["remarks"] and "盘点" in op["remarks"]]
+        assert len(stocktake_ops) >= 2
+
+        ledger_entries = LedgerDB.get_all()
+        stocktake_ledger = [l for l in ledger_entries if l["operation_type"] == "stocktake"]
+        assert len(stocktake_ledger) >= 2
+
+        for ledge in stocktake_ledger:
+            assert ledge["change_quantity"] != 0
+
+        test_passed("写回操作正确记录到操作日志和台账")
+        passed += 1
+
+        logs = stocktake_mgr.get_logs({"order_id": order_id})
+        write_back_logs = [l for l in logs if l["operation_type"] == "write_back"]
+        assert len(write_back_logs) >= 2
+
+        item_write_back_logs = [l for l in write_back_logs if l.get("reagent_name")]
+        assert len(item_write_back_logs) == 2
+
+        for log in item_write_back_logs:
+            assert log["old_value"] is not None
+            assert log["new_value"] is not None
+            assert log["old_value"] != log["new_value"]
+
+        test_passed("写回操作日志完整记录原值和新值")
+        passed += 1
+
+    except AssertionError as e:
+        test_failed("差异写回库存", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("差异写回库存", str(e) if str(e) else "未知错误")
+        import traceback
+        traceback.print_exc()
+        failed += 1
+
+    # Test 50: 跨重启状态恢复测试
+    print("\n【测试 50】跨重启状态恢复测试")
+    try:
+        auth.login("admin")
+        reset_database()
+
+        future_date = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+
+        reagent_id, _ = manager.create_reagent(
+            "重启测试试剂", "RESTART-STK-001", 80, "瓶",
+            expiration_date=future_date
+        )
+
+        draft_order_id, _ = stocktake_mgr.create_order(
+            title="草稿盘点单-重启测试",
+            storage_location="测试区"
+        )
+        draft_item_id, _ = stocktake_mgr.add_item(
+            order_id=draft_order_id,
+            reagent_name="重启测试试剂",
+            batch_number="RESTART-STK-001",
+            actual_quantity=90,
+            unit="瓶"
+        )
+
+        confirmed_order_id, _ = stocktake_mgr.create_order(
+            title="已确认盘点单-重启测试",
+            storage_location="测试区"
+        )
+        confirmed_item_id, _ = stocktake_mgr.add_item(
+            order_id=confirmed_order_id,
+            reagent_name="重启测试试剂",
+            batch_number="RESTART-STK-001",
+            actual_quantity=70,
+            unit="瓶"
+        )
+        stocktake_mgr.confirm_item(confirmed_item_id)
+
+        orders_before = stocktake_mgr.get_orders()
+        items_before_draft = stocktake_mgr.get_items(draft_order_id)
+        items_before_confirmed = stocktake_mgr.get_items(confirmed_order_id)
+        logs_before = stocktake_mgr.get_logs()
+
+        assert len(orders_before) == 2
+        assert len(items_before_draft) == 1
+        assert len(items_before_confirmed) == 1
+        assert len(logs_before) >= 3
+
+        close_db()
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM stocktake_orders")
+        db_order_count = cursor.fetchone()[0]
+        assert db_order_count == 2
+
+        cursor.execute("SELECT COUNT(*) FROM stocktake_items")
+        db_item_count = cursor.fetchone()[0]
+        assert db_item_count == 2
+
+        cursor.execute("SELECT COUNT(*) FROM stocktake_logs")
+        db_log_count = cursor.fetchone()[0]
+        assert db_log_count >= 3
+
+        cursor.execute("SELECT status FROM stocktake_orders WHERE id = ?", (draft_order_id,))
+        assert cursor.fetchone()[0] == "draft"
+
+        cursor.execute("SELECT status FROM stocktake_orders WHERE id = ?", (confirmed_order_id,))
+        assert cursor.fetchone()[0] == "draft"
+
+        cursor.execute("SELECT process_status FROM stocktake_items WHERE id = ?", (confirmed_item_id,))
+        assert cursor.fetchone()[0] == "confirmed"
+
+        conn.close()
+
+        init_database()
+        auth.login("admin")
+        stocktake_mgr_restart = StocktakeManager(auth)
+
+        orders_after = stocktake_mgr_restart.get_orders()
+        items_after_draft = stocktake_mgr_restart.get_items(draft_order_id)
+        items_after_confirmed = stocktake_mgr_restart.get_items(confirmed_order_id)
+        logs_after = stocktake_mgr_restart.get_logs()
+
+        assert len(orders_after) == len(orders_before)
+        assert len(items_after_draft) == len(items_before_draft)
+        assert len(items_after_confirmed) == len(items_before_confirmed)
+        assert len(logs_after) == len(logs_before)
+
+        draft_order_after = stocktake_mgr_restart.get_order_by_id(draft_order_id)
+        assert draft_order_after["status"] == "draft"
+        assert draft_order_after["total_items"] == 1
+
+        confirmed_order_after = stocktake_mgr_restart.get_order_by_id(confirmed_order_id)
+        assert confirmed_order_after["status"] == "draft"
+
+        confirmed_item_after = StocktakeItemDB.get_by_id(confirmed_item_id)
+        assert confirmed_item_after["process_status"] == "confirmed"
+        assert confirmed_item_after["actual_quantity"] == 70
+
+        test_passed("跨重启状态恢复成功：盘点单、盘点项、日志状态和数据完整保留")
+        passed += 1
+
+        write_count, msg = stocktake_mgr_restart.write_back_to_inventory(
+            confirmed_order_id, write_all_confirmed=True
+        )
+        assert write_count == 1
+
+        reagent_after = ReagentDB.get_by_id(reagent_id)
+        assert reagent_after["quantity"] == 70
+
+        test_passed("重启后可正常进行写回操作，功能不受影响")
+        passed += 1
+
+    except AssertionError as e:
+        test_failed("跨重启状态恢复", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("跨重启状态恢复", str(e) if str(e) else "未知错误")
+        import traceback
+        traceback.print_exc()
+        failed += 1
+
+    # Test 51: CSV导出内容测试
+    print("\n【测试 51】CSV导出内容测试")
+    try:
+        auth.login("admin")
+        reset_database()
+
+        future_date = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        past_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+
+        manager.create_reagent(
+            "导出测试试剂A", "EXPORT-A-001", 100, "瓶",
+            expiration_date=future_date, storage_condition="A-01"
+        )
+        manager.create_reagent(
+            "导出测试试剂B", "EXPORT-B-001", 50, "瓶",
+            expiration_date=past_date, storage_condition="A-02"
+        )
+
+        order_id, _ = stocktake_mgr.create_order(
+            title="导出测试盘点单",
+            storage_location="测试区"
+        )
+
+        stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="导出测试试剂A",
+            batch_number="EXPORT-A-001",
+            actual_quantity=110,
+            unit="瓶",
+            storage_location="A-01",
+            diff_reason="盘点有差异"
+        )
+        stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="导出测试试剂B",
+            batch_number="EXPORT-B-001",
+            actual_quantity=45,
+            unit="瓶",
+            storage_location="A-02",
+            diff_reason="部分使用"
+        )
+
+        items_before = stocktake_mgr.get_items(order_id)
+        assert len(items_before) == 2
+
+        export_path = os.path.join(os.path.dirname(DB_PATH), "test_stocktake_export.csv")
+        count, msg = csv_mgr.export_stocktake_order(export_path, order_id, stocktake_mgr)
+        assert count == 2
+        assert os.path.exists(export_path)
+
+        with open(export_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+
+            expected_headers = ["盘点单号", "盘点单标题", "状态", "试剂名称", "批号", "存放位置",
+                               "账面数", "实盘数", "差异数", "单位", "过期日期",
+                               "冲突类型", "处理状态", "差异原因", "创建时间", "更新时间"]
+            assert headers == expected_headers, f"表头顺序错误。预期：{expected_headers}，实际：{headers}"
+
+            rows = list(reader)
+            assert len(rows) == 2
+
+            for row in rows:
+                assert "盘点单号" in row and row["盘点单号"]
+                assert "试剂名称" in row and row["试剂名称"]
+                assert "批号" in row and row["批号"]
+                assert "账面数" in row and row["账面数"].isdigit()
+                assert "实盘数" in row and row["实盘数"].isdigit()
+                assert "差异数" in row
+                assert "冲突类型" in row
+                assert "处理状态" in row
+
+            row_a = next(r for r in rows if r["批号"] == "EXPORT-A-001")
+            assert row_a["试剂名称"] == "导出测试试剂A"
+            assert row_a["账面数"] == "100"
+            assert row_a["实盘数"] == "110"
+            assert int(row_a["差异数"]) == 10
+            assert row_a["冲突类型"] == "无冲突"
+            assert row_a["差异原因"] == "盘点有差异"
+
+            row_b = next(r for r in rows if r["批号"] == "EXPORT-B-001")
+            assert row_b["试剂名称"] == "导出测试试剂B"
+            assert row_b["账面数"] == "50"
+            assert row_b["实盘数"] == "45"
+            assert int(row_b["差异数"]) == -5
+            assert row_b["冲突类型"] == "已过期"
+            assert row_b["差异原因"] == "部分使用"
+
+        test_passed("盘点单导出内容正确，包含所有字段，差异数显示正确")
+        passed += 1
+
+        with open(export_path, 'rb') as f:
+            bom = f.read(3)
+            assert bom == b'\xef\xbb\xbf', "CSV文件没有UTF-8 BOM，Excel打开可能乱码"
+
+        test_passed("导出文件使用UTF-8 BOM编码，Excel兼容性好")
+        passed += 1
+
+        logs_export_path = os.path.join(os.path.dirname(DB_PATH), "test_stocktake_logs_export.csv")
+        log_count, log_msg = csv_mgr.export_stocktake_logs(logs_export_path, {"order_id": order_id})
+        assert log_count >= 2
+        assert os.path.exists(logs_export_path)
+
+        with open(logs_export_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            assert "操作时间" in headers
+            assert "操作人" in headers
+            assert "操作类型" in headers
+            assert "试剂名称" in headers
+            assert "批号" in headers
+            assert "原值" in headers
+            assert "新值" in headers
+            assert "差异原因" in headers
+
+            rows = list(reader)
+            assert len(rows) == log_count
+
+        test_passed("盘点日志导出内容正确，包含所有审计字段")
+        passed += 1
+
+        os.remove(export_path)
+        os.remove(logs_export_path)
+
+    except AssertionError as e:
+        test_failed("CSV导出内容", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("CSV导出内容", str(e) if str(e) else "未知错误")
+        import traceback
+        traceback.print_exc()
+        failed += 1
+
+    # Test 52: 盘点单状态流转测试
+    print("\n【测试 52】盘点单状态流转测试")
+    try:
+        auth.login("admin")
+        reset_database()
+
+        future_date = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        manager.create_reagent(
+            "状态测试试剂", "STATUS-001", 100, "瓶",
+            expiration_date=future_date
+        )
+
+        order_id, _ = stocktake_mgr.create_order(
+            title="状态流转测试盘点单",
+            storage_location="测试区"
+        )
+        item_id, _ = stocktake_mgr.add_item(
+            order_id=order_id,
+            reagent_name="状态测试试剂",
+            batch_number="STATUS-001",
+            actual_quantity=90,
+            unit="瓶"
+        )
+
+        order = stocktake_mgr.get_order_by_id(order_id)
+        assert order["status"] == "draft"
+
+        try:
+            stocktake_mgr.write_back_to_inventory(order_id, write_all_confirmed=True)
+            test_failed("草稿状态写回", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "先确认盘点项" in str(e):
+                test_passed("草稿状态且未确认时不能写回（状态校验正确）")
+                passed += 1
+            else:
+                test_failed("草稿状态写回", f"异常信息不符：{e}")
+                failed += 1
+
+        stocktake_mgr.confirm_item(item_id)
+        count, msg = stocktake_mgr.write_back_to_inventory(order_id, write_all_confirmed=True)
+        assert count == 1
+
+        order_after = stocktake_mgr.get_order_by_id(order_id)
+        assert order_after["status"] == "confirmed"
+        assert order_after["confirmed_at"] is not None
+
+        test_passed("写回后盘点单状态正确变为已确认，并记录确认时间")
+        passed += 1
+
+        try:
+            stocktake_mgr.add_item(order_id, "测试", "TEST", 10)
+            test_failed("已确认状态添加项", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "草稿" in str(e):
+                test_passed("已确认状态不能添加盘点项（状态校验正确）")
+                passed += 1
+            else:
+                test_failed("已确认状态添加项", f"异常信息不符：{e}")
+                failed += 1
+
+        cancel_order_id, _ = stocktake_mgr.create_order(
+            title="取消测试盘点单",
+            storage_location="测试区"
+        )
+
+        success, msg = stocktake_mgr.cancel_order(cancel_order_id)
+        assert success
+
+        cancelled_order = stocktake_mgr.get_order_by_id(cancel_order_id)
+        assert cancelled_order["status"] == "cancelled"
+
+        try:
+            stocktake_mgr.add_item(cancel_order_id, "测试", "TEST", 10)
+            test_failed("已取消状态添加项", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "草稿" in str(e):
+                test_passed("已取消状态不能添加盘点项（状态校验正确）")
+                passed += 1
+            else:
+                test_failed("已取消状态添加项", f"异常信息不符：{e}")
+                failed += 1
+
+        try:
+            stocktake_mgr.cancel_order(order_id)
+            test_failed("取消已确认盘点单", "应该失败但成功了")
+            failed += 1
+        except OperationError as e:
+            if "已确认" in str(e):
+                test_passed("已确认盘点单不能取消（状态校验正确）")
+                passed += 1
+            else:
+                test_failed("取消已确认盘点单", f"异常信息不符：{e}")
+                failed += 1
+
+    except AssertionError as e:
+        test_failed("盘点单状态流转", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("盘点单状态流转", str(e) if str(e) else "未知错误")
+        import traceback
+        traceback.print_exc()
+        failed += 1
+
+    # Test 53: 筛选功能测试
+    print("\n【测试 53】筛选功能测试")
+    try:
+        auth.login("admin")
+        reset_database()
+
+        future_date = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+
+        manager.create_reagent("筛选试剂A", "FILTER-A-001", 100, "瓶", expiration_date=future_date, storage_condition="冷藏库")
+        manager.create_reagent("筛选试剂B", "FILTER-B-001", 50, "瓶", expiration_date=future_date, storage_condition="常温库")
+
+        order1_id, _ = stocktake_mgr.create_order(title="Q1盘点", storage_location="冷藏库")
+        order2_id, _ = stocktake_mgr.create_order(title="Q2盘点", storage_location="常温库")
+
+        stocktake_mgr.add_item(order1_id, "筛选试剂A", "FILTER-A-001", 105, "瓶", "冷藏库-A1", "盘盈")
+        stocktake_mgr.add_item(order1_id, "筛选试剂B", "FILTER-B-001", 48, "瓶", "常温库-B1", "盘亏")
+
+        stocktake_mgr.add_item(order2_id, "筛选试剂A", "FILTER-A-001", 95, "瓶", "冷藏库-A1", "领用")
+        stocktake_mgr.add_item(order2_id, "不存在试剂", "FILTER-C-001", 10, "瓶", "未知库", "新发现")
+
+        stocktake_mgr.confirm_item(stocktake_mgr.get_items(order1_id)[0]["id"])
+
+        all_orders = stocktake_mgr.get_orders()
+        assert len(all_orders) == 2
+
+        title_filtered = stocktake_mgr.get_orders({"title": "Q1"})
+        assert len(title_filtered) == 1
+        assert title_filtered[0]["title"] == "Q1盘点"
+
+        location_filtered = stocktake_mgr.get_orders({"storage_location": "冷藏库"})
+        assert len(location_filtered) == 1
+
+        test_passed("盘点单筛选功能正常（按标题、存放位置）")
+        passed += 1
+
+        all_items = stocktake_mgr.get_items(order1_id)
+        assert len(all_items) == 2
+
+        name_filtered = stocktake_mgr.get_items(order1_id, {"reagent_name": "筛选试剂A"})
+        assert len(name_filtered) == 1
+        assert name_filtered[0]["reagent_name"] == "筛选试剂A"
+
+        batch_filtered = stocktake_mgr.get_items(order1_id, {"batch_number": "FILTER-B-001"})
+        assert len(batch_filtered) == 1
+        assert batch_filtered[0]["batch_number"] == "FILTER-B-001"
+
+        status_filtered = stocktake_mgr.get_items(order1_id, {"process_status": "confirmed"})
+        assert len(status_filtered) == 1
+
+        has_diff_filtered = stocktake_mgr.get_items(order1_id, {"has_diff": True})
+        assert len(has_diff_filtered) == 2
+
+        no_diff_filtered = stocktake_mgr.get_items(order1_id, {"has_diff": False})
+        assert len(no_diff_filtered) == 0
+
+        all_items_order2 = stocktake_mgr.get_items(order2_id)
+        conflict_filtered = stocktake_mgr.get_items(order2_id, {"conflict_type": "batch_not_found"})
+        assert len(conflict_filtered) == 1
+        assert conflict_filtered[0]["reagent_name"] == "不存在试剂"
+
+        test_passed("盘点项筛选功能正常（按试剂名、批号、状态、冲突类型、差异）")
+        passed += 1
+
+    except AssertionError as e:
+        test_failed("筛选功能", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("筛选功能", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 54: 自动从库存填充测试
+    print("\n【测试 54】自动从库存填充盘点项测试")
+    try:
+        auth.login("admin")
+        reset_database()
+
+        future_date = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+
+        manager.create_reagent("自动填充试剂A", "AUTO-A-001", 100, "瓶", expiration_date=future_date, storage_condition="A-01")
+        manager.create_reagent("自动填充试剂B", "AUTO-B-001", 50, "瓶", expiration_date=future_date, storage_condition="A-02")
+        manager.create_reagent("自动填充试剂C", "AUTO-C-001", 30, "瓶", expiration_date=future_date, storage_condition="A-03")
+
+        order_id, msg = stocktake_mgr.create_order(
+            title="自动填充测试",
+            storage_location="测试区",
+            auto_fill_from_inventory=True
+        )
+
+        items = stocktake_mgr.get_items(order_id)
+        assert len(items) == 3
+
+        reagent_names = [item["reagent_name"] for item in items]
+        assert "自动填充试剂A" in reagent_names
+        assert "自动填充试剂B" in reagent_names
+        assert "自动填充试剂C" in reagent_names
+
+        for item in items:
+            assert item["expected_quantity"] == item["actual_quantity"]
+            assert item["diff_quantity"] == 0
+            assert item["process_status"] == "pending"
+
+        item_a = next(i for i in items if i["batch_number"] == "AUTO-A-001")
+        assert item_a["expected_quantity"] == 100
+        assert item_a["actual_quantity"] == 100
+        assert item_a["storage_location"] == "A-01"
+        assert item_a["unit"] == "瓶"
+
+        test_passed("自动从库存填充盘点项成功，账面数和实盘数默认一致")
+        passed += 1
+
+    except AssertionError as e:
+        test_failed("自动从库存填充", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("自动从库存填充", str(e) if str(e) else "未知错误")
+        import traceback
+        traceback.print_exc()
         failed += 1
 
     # 清理测试数据库
