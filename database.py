@@ -127,7 +127,7 @@ def init_database():
             reservation_id INTEGER,
             operation_type TEXT NOT NULL CHECK(operation_type IN (
                 'create', 'approve', 'reject', 'cancel', 'complete',
-                'expire_release', 'reschedule', 'revert'
+                'expire_release', 'reschedule', 'reschedule_release', 'revert'
             )),
             reagent_id INTEGER,
             reagent_name TEXT,
@@ -155,6 +155,44 @@ def init_database():
     columns = [col[1] for col in cursor.fetchall()]
     if 'locked_quantity' not in columns:
         cursor.execute("ALTER TABLE reagents ADD COLUMN locked_quantity INTEGER NOT NULL DEFAULT 0")
+
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='reservation_logs'")
+    row = cursor.fetchone()
+    if row and 'reschedule_release' not in row[0]:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reservation_logs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reservation_id INTEGER,
+                operation_type TEXT NOT NULL CHECK(operation_type IN (
+                    'create', 'approve', 'reject', 'cancel', 'complete',
+                    'expire_release', 'reschedule', 'reschedule_release', 'revert'
+                )),
+                reagent_id INTEGER,
+                reagent_name TEXT,
+                batch_number TEXT,
+                quantity INTEGER,
+                operator_id INTEGER,
+                operator_name TEXT,
+                reviewer_id INTEGER,
+                reviewer_name TEXT,
+                status_before TEXT,
+                status_after TEXT,
+                locked_qty_change INTEGER DEFAULT 0,
+                stock_qty_change INTEGER DEFAULT 0,
+                remarks TEXT,
+                operation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                revertable INTEGER DEFAULT 0,
+                snapshot_before TEXT,
+                snapshot_after TEXT,
+                FOREIGN KEY (reservation_id) REFERENCES reservations(id),
+                FOREIGN KEY (reagent_id) REFERENCES reagents(id)
+            )
+        """)
+        cursor.execute("""
+            INSERT INTO reservation_logs_new SELECT * FROM reservation_logs
+        """)
+        cursor.execute("DROP TABLE reservation_logs")
+        cursor.execute("ALTER TABLE reservation_logs_new RENAME TO reservation_logs")
 
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
@@ -209,6 +247,9 @@ class ReagentDB:
         params = []
 
         if filters:
+            if filters.get("id"):
+                query += " AND id = ?"
+                params.append(filters["id"])
             if filters.get("batch_number"):
                 query += " AND batch_number LIKE ?"
                 params.append(f"%{filters['batch_number']}%")

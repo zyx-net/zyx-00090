@@ -105,6 +105,7 @@ RESERVATION_OPERATION_DISPLAY = {
     "complete": "实际领用",
     "expire_release": "过期释放",
     "reschedule": "改期",
+    "reschedule_release": "改期释放锁定",
     "revert": "撤销操作"
 }
 

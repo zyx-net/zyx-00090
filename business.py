@@ -660,6 +660,37 @@ class ReagentManager:
             raise OperationError("新计划使用日期不能早于今天")
 
         old_date = reservation["planned_use_date"]
+        qty = reservation["quantity"]
+        reagent_id = reservation["reagent_id"]
+
+        if reservation["status"] == "approved":
+            reagent_before = ReagentDB.get_by_id(reagent_id)
+            snapshot_before_release = json.dumps(reagent_before, ensure_ascii=False)
+            if not ReagentLockDB.update_locked_quantity(reagent_id, -qty):
+                raise OperationError("释放原预约锁定量失败")
+            reagent_after_release = ReagentDB.get_by_id(reagent_id)
+            snapshot_after_release = json.dumps(reagent_after_release, ensure_ascii=False)
+
+            ReservationLogDB.create(
+                operation_type="reschedule_release",
+                reservation_id=reservation_id,
+                reagent_id=reagent_id,
+                reagent_name=reservation["reagent_name"],
+                batch_number=reservation["batch_number"],
+                quantity=qty,
+                operator_id=reservation["operator_id"],
+                operator_name=reservation.get("operator_name", ""),
+                reviewer_id=self.auth.current_user["id"],
+                reviewer_name=self.auth.current_user["display_name"],
+                status_before="approved",
+                status_after="rescheduled",
+                locked_qty_change=-qty,
+                remarks=f"改期释放原锁定量，原日期：{old_date}",
+                revertable=0,
+                snapshot_before=snapshot_before_release,
+                snapshot_after=snapshot_after_release
+            )
+
         ReservationDB.update_status(
             reservation_id, "rescheduled",
             reviewer_id=self.auth.current_user["id"],
@@ -668,10 +699,10 @@ class ReagentManager:
         )
 
         new_reservation_id = ReservationDB.create(
-            reagent_id=reservation["reagent_id"],
+            reagent_id=reagent_id,
             reagent_name=reservation["reagent_name"],
             batch_number=reservation["batch_number"],
-            quantity=reservation["quantity"],
+            quantity=qty,
             planned_use_date=new_planned_date,
             operator_id=reservation["operator_id"],
             remarks=f"由预约#{reservation_id}改期而来，原日期：{old_date}",
@@ -679,11 +710,12 @@ class ReagentManager:
         )
 
         if reservation["status"] == "approved":
-            reagent = ReagentDB.get_by_id(reservation["reagent_id"])
-            snapshot_before = json.dumps(reagent, ensure_ascii=False)
-            ReagentLockDB.update_locked_quantity(reservation["reagent_id"], reservation["quantity"])
-            reagent_after = ReagentDB.get_by_id(reservation["reagent_id"])
-            snapshot_after = json.dumps(reagent_after, ensure_ascii=False)
+            reagent_before_approve = ReagentDB.get_by_id(reagent_id)
+            snapshot_before_approve = json.dumps(reagent_before_approve, ensure_ascii=False)
+            if not ReagentLockDB.update_locked_quantity(reagent_id, qty):
+                raise OperationError("锁定新预约库存失败")
+            reagent_after_approve = ReagentDB.get_by_id(reagent_id)
+            snapshot_after_approve = json.dumps(reagent_after_approve, ensure_ascii=False)
 
             ReservationDB.update_status(
                 new_reservation_id, "approved",
@@ -694,21 +726,21 @@ class ReagentManager:
             ReservationLogDB.create(
                 operation_type="approve",
                 reservation_id=new_reservation_id,
-                reagent_id=reservation["reagent_id"],
+                reagent_id=reagent_id,
                 reagent_name=reservation["reagent_name"],
                 batch_number=reservation["batch_number"],
-                quantity=reservation["quantity"],
+                quantity=qty,
                 operator_id=reservation["operator_id"],
                 operator_name=reservation.get("operator_name", ""),
                 reviewer_id=self.auth.current_user["id"],
                 reviewer_name=self.auth.current_user["display_name"],
                 status_before="pending",
                 status_after="approved",
-                locked_qty_change=reservation["quantity"],
+                locked_qty_change=qty,
                 remarks=f"改期自动审批，原预约#{reservation_id}",
                 revertable=1,
-                snapshot_before=snapshot_before,
-                snapshot_after=snapshot_after
+                snapshot_before=snapshot_before_approve,
+                snapshot_after=snapshot_after_approve
             )
 
         log_id = ReservationLogDB.create(

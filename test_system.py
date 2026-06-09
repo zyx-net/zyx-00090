@@ -781,6 +781,181 @@ def run_tests():
         test_failed("预约改期", str(e) if str(e) else "未知错误")
         failed += 1
 
+    # Test 21b: 已审批预约改期 - 核心回归测试（锁定量不翻倍）
+    print("\n【测试 21b】已审批预约改期回归测试（核心修复：锁定量不翻倍）")
+    auth.login("admin")
+    try:
+        import time
+        reg_approved_id, _ = manager.create_reagent(
+            "改期回归测试试剂", "REG-APPROVED-001", 100, "瓶",
+            expiration_date=(datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        )
+
+        reagent_init = ReagentDB.get_by_id(reg_approved_id)
+        assert reagent_init["quantity"] == 100
+        assert reagent_init.get("locked_quantity", 0) == 0
+
+        auth.login("lab_staff")
+        planned_date1 = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        reg_res_id, _ = manager.create_reservation(
+            reg_approved_id, 30, planned_date1, "回归测试-创建"
+        )
+
+        reagent_after_create = ReagentDB.get_by_id(reg_approved_id)
+        assert reagent_after_create.get("locked_quantity", 0) == 0
+
+        auth.login("auditor")
+        time.sleep(0.1)
+        manager.approve_reservation(reg_res_id, "回归测试-审批")
+
+        reagent_after_approve = ReagentDB.get_by_id(reg_approved_id)
+        assert reagent_after_approve.get("locked_quantity", 0) == 30, \
+            f"审批后锁定量应为30，实际是{reagent_after_approve.get('locked_quantity', 0)}"
+        assert reagent_after_approve["quantity"] == 100
+        assert ReagentLockDB.get_available_quantity(reg_approved_id) == 70
+
+        res_after_approve = ReservationDB.get_by_id(reg_res_id)
+        assert res_after_approve["status"] == "approved"
+
+        time.sleep(0.1)
+        new_date = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
+        log_id, msg = manager.reschedule_reservation(
+            reg_res_id, new_date, "回归测试-已审批改期"
+        )
+
+        old_res = ReservationDB.get_by_id(reg_res_id)
+        assert old_res["status"] == "rescheduled", \
+            f"旧预约状态应为rescheduled，实际是{old_res['status']}"
+
+        all_res = manager.get_reservations()
+        new_res_list = [r for r in all_res if r["remarks"] and f"由预约#{reg_res_id}改期" in r["remarks"]]
+        assert len(new_res_list) == 1, f"应找到1个新预约，实际{len(new_res_list)}个"
+        new_reg_res = new_res_list[0]
+        assert new_reg_res["status"] == "approved", \
+            f"新预约状态应为approved，实际是{new_reg_res['status']}"
+        assert new_reg_res["quantity"] == 30
+
+        reagent_after_reschedule = ReagentDB.get_by_id(reg_approved_id)
+        final_locked = reagent_after_reschedule.get("locked_quantity", 0)
+        assert final_locked == 30, \
+            f"改期后锁定量应为30（不翻倍！），实际是{final_locked}"
+        assert reagent_after_reschedule["quantity"] == 100
+        assert ReagentLockDB.get_available_quantity(reg_approved_id) == 70, \
+            f"改期后可用量应为70，实际是{ReagentLockDB.get_available_quantity(reg_approved_id)}"
+
+        test_passed(
+            "已审批改期核心验证通过："
+            f"总库存={reagent_after_reschedule['quantity']}, "
+            f"锁定={final_locked}（未翻倍！）, "
+            f"可用={ReagentLockDB.get_available_quantity(reg_approved_id)}"
+        )
+        passed += 1
+
+        time.sleep(0.1)
+        manager.cancel_reservation(new_reg_res["id"], "回归测试-取消新预约")
+        reagent_after_cancel = ReagentDB.get_by_id(reg_approved_id)
+        assert reagent_after_cancel.get("locked_quantity", 0) == 0, \
+            f"取消后锁定量应为0，实际是{reagent_after_cancel.get('locked_quantity', 0)}"
+        assert ReagentLockDB.get_available_quantity(reg_approved_id) == 100
+
+        test_passed("改期后取消预约验证通过：锁定量正确释放为0")
+        passed += 1
+
+        auth.login("lab_staff")
+        planned_date2 = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        reg_res2_id, _ = manager.create_reservation(
+            reg_approved_id, 25, planned_date2, "回归测试-领用测试"
+        )
+
+        auth.login("auditor")
+        time.sleep(0.1)
+        manager.approve_reservation(reg_res2_id, "回归测试-审批2")
+
+        reagent_after_approve2 = ReagentDB.get_by_id(reg_approved_id)
+        assert reagent_after_approve2.get("locked_quantity", 0) == 25
+
+        time.sleep(0.1)
+        new_date2 = (datetime.now() + timedelta(days=21)).strftime("%Y-%m-%d")
+        manager.reschedule_reservation(reg_res2_id, new_date2, "回归测试-改期后领用")
+
+        all_res2 = manager.get_reservations()
+        new_res2_list = [r for r in all_res2 if r["remarks"] and f"由预约#{reg_res2_id}改期" in r["remarks"]]
+        new_reg_res2 = new_res2_list[0]
+        assert new_reg_res2["status"] == "approved"
+
+        reagent_after_reschedule2 = ReagentDB.get_by_id(reg_approved_id)
+        assert reagent_after_reschedule2.get("locked_quantity", 0) == 25, \
+            f"改期后锁定量应为25，实际是{reagent_after_reschedule2.get('locked_quantity', 0)}"
+
+        time.sleep(0.1)
+        manager.complete_reservation(new_reg_res2["id"], "回归测试-实际领用")
+
+        reagent_after_complete = ReagentDB.get_by_id(reg_approved_id)
+        assert reagent_after_complete["quantity"] == 75
+        assert reagent_after_complete.get("locked_quantity", 0) == 0
+        assert ReagentLockDB.get_available_quantity(reg_approved_id) == 75
+
+        test_passed("改期后实际领用验证通过：库存75，锁定0，可用75")
+        passed += 1
+
+        close_db()
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT quantity, locked_quantity FROM reagents WHERE id = ?",
+            (reg_approved_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        assert row[0] == 75
+        assert row[1] == 0
+
+        init_database()
+
+        reagent_after_restart = ReagentDB.get_by_id(reg_approved_id)
+        assert reagent_after_restart["quantity"] == 75
+        assert reagent_after_restart.get("locked_quantity", 0) == 0
+        assert ReagentLockDB.get_available_quantity(reg_approved_id) == 75
+
+        test_passed("重启后数据一致验证通过：库存、锁定量、可用量均正确")
+        passed += 1
+
+        res_with_lock = manager.get_reagents_with_lock_info({"id": reg_approved_id})
+        assert len(res_with_lock) == 1
+        info = res_with_lock[0]
+        assert info["quantity"] == 75
+        assert info.get("locked_quantity", 0) == 0
+        assert info.get("available_quantity", 0) == 75
+        assert "reservation_summary" in info
+
+        test_passed("接口层数据一致验证通过：可用量、锁定量、预约摘要均正确")
+        passed += 1
+
+        export_path = os.path.join(os.path.dirname(DB_PATH), "test_regression_export.csv")
+        import csv
+        count, msg = csv_mgr.export_reagents(export_path)
+        with open(export_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row["试剂名称"] == "改期回归测试试剂":
+                    assert int(row["总库存"]) == 75
+                    assert int(row["已锁定量"]) == 0
+                    assert int(row["可用量"]) == 75
+                    assert row["预约摘要"] is not None
+
+        test_passed("CSV导出数据一致验证通过：总库存、已锁定量、可用量均正确")
+        passed += 1
+
+        os.remove(export_path)
+
+    except AssertionError as e:
+        test_failed("已审批改期回归测试", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("已审批改期回归测试", str(e) if str(e) else "未知错误")
+        failed += 1
+
     # Test 22: 实际领用和库存扣减
     print("\n【测试 22】实际领用和库存扣减测试")
     try:
