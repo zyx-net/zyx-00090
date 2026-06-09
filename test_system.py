@@ -1762,7 +1762,10 @@ def run_tests():
         assert ledger_count_before == ledger_count_after, "预检不应修改台账"
         assert operation_count_before == operation_count_after, "预检不应修改操作日志"
 
-        test_passed("预检不落库：试剂表、台账、操作日志均未变化")
+        import_results_after = ImportResultDB.get_all(100)
+        assert len(import_results_after) == 0, f"预检不应写入 import_results 表，实际有 {len(import_results_after)} 条记录"
+
+        test_passed("预检不落库：试剂表、台账、操作日志、导入结果表均未变化")
         passed += 1
 
         summary = csv_mgr.get_preview_summary(preview_result)
@@ -1897,13 +1900,18 @@ def run_tests():
         failed += 1
 
     # Test 28: 无权限拒绝测试
-    print("\n【测试 28】无权限拒绝测试")
+    print("\n【测试 28】无权限拒绝测试（含写库防护验证）")
     try:
         auth.login("lab_staff")
         reset_database()
 
         test_csv_path = os.path.join(os.path.dirname(DB_PATH), "test_permission.csv")
         csv_mgr.create_sample_import(test_csv_path)
+
+        import_count_before = len(ImportResultDB.get_all(100))
+        reagent_count_before = len(ReagentDB.get_all())
+        ledger_count_before = len(LedgerDB.get_all())
+        operation_count_before = len(OperationDB.get_all(1000))
 
         try:
             csv_mgr.preview_import(test_csv_path)
@@ -1943,6 +1951,19 @@ def run_tests():
                 test_failed("审核员预检", f"异常信息不符：{e}")
                 failed += 1
 
+        import_count_after = len(ImportResultDB.get_all(100))
+        reagent_count_after = len(ReagentDB.get_all())
+        ledger_count_after = len(LedgerDB.get_all())
+        operation_count_after = len(OperationDB.get_all(1000))
+
+        assert import_count_before == import_count_after, f"无权限用户尝试操作不应写入 import_results，变化了 {import_count_after - import_count_before} 条"
+        assert reagent_count_before == reagent_count_after, "无权限用户尝试操作不应修改试剂表"
+        assert ledger_count_before == ledger_count_after, "无权限用户尝试操作不应修改台账"
+        assert operation_count_before == operation_count_after, "无权限用户尝试操作不应修改操作日志"
+
+        test_passed("无权限角色预检/导入尝试均不会写库")
+        passed += 1
+
         os.remove(test_csv_path)
     except AssertionError as e:
         test_failed("无权限拒绝", str(e) if str(e) else "断言失败")
@@ -1952,7 +1973,7 @@ def run_tests():
         failed += 1
 
     # Test 29: 跨重启记录一致性测试
-    print("\n【测试 29】跨重启记录一致性测试")
+    print("\n【测试 29】跨重启记录一致性测试（预检不落库，仅导入后写库）")
     try:
         auth.login("admin")
         reset_database()
@@ -1962,6 +1983,23 @@ def run_tests():
 
         preview_result = csv_mgr.preview_import(persist_csv_path)
         preview_file_hash = preview_result["file_hash"]
+
+        import_results_after_preview = ImportResultDB.get_all(100)
+        assert len(import_results_after_preview) == 0, f"预检后 import_results 表应为空，实际有 {len(import_results_after_preview)} 条记录"
+        test_passed("预检后数据库无导入记录（符合预期）")
+        passed += 1
+
+        history_after_preview = csv_mgr.get_import_history(10)
+        assert len(history_after_preview) == 0, f"预检后查询导入历史应为空，实际有 {len(history_after_preview)} 条"
+
+        close_db()
+        init_database()
+        auth.login("admin")
+        csv_mgr_restart1 = CSVManager(auth)
+        history_after_restart1 = csv_mgr_restart1.get_import_history(10)
+        assert len(history_after_restart1) == 0, f"模拟重启后导入历史仍应为空，实际有 {len(history_after_restart1)} 条"
+        test_passed("预检后重启界面无导入历史（符合预期）")
+        passed += 1
 
         success, skipped, errors, warnings = csv_mgr.import_reagents(persist_csv_path)
         assert success == 3, f"导入应成功3条，实际{success}"

@@ -2180,7 +2180,6 @@ class ReagentManagementApp:
                 self.import_status_var.set("✅ 预检完成，可执行导入")
 
             self._update_import_buttons()
-            self._refresh_import_history()
             self.set_status("预检完成")
 
             if preview_result["stock_warnings"] or preview_result["conflict_batches"]:

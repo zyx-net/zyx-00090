@@ -253,22 +253,6 @@ class CSVManager:
             "valid_rows": valid_rows
         }
 
-        if self.auth.current_user:
-            ImportResultDB.create(
-                filepath=filepath,
-                file_hash=file_hash,
-                success_count=success_count,
-                skip_count=skip_count,
-                total_rows=total_rows,
-                errors=errors,
-                warnings=warnings,
-                conflict_batches=conflict_batches,
-                stock_warnings=stock_warnings,
-                operator_id=self.auth.current_user["id"],
-                operator_name=self.auth.current_user["display_name"],
-                status="previewed"
-            )
-
         return result
 
     def check_file_changed(self, filepath: str, expected_hash: str) -> Tuple[bool, str]:
@@ -371,28 +355,20 @@ class CSVManager:
                 actual_skip += 1
                 continue
 
-        saved_result = ImportResultDB.get_by_file_hash(current_hash)
-        if saved_result:
-            ImportResultDB.update_status(
-                saved_result["id"], "imported",
-                success_count=actual_success,
-                skip_count=actual_skip
-            )
-        else:
-            ImportResultDB.create(
-                filepath=filepath,
-                file_hash=current_hash,
-                success_count=actual_success,
-                skip_count=actual_skip,
-                total_rows=actual_success + actual_skip,
-                errors=errors,
-                warnings=warnings,
-                conflict_batches=conflict_batches,
-                stock_warnings=stock_warnings,
-                operator_id=self.auth.current_user["id"],
-                operator_name=self.auth.current_user["display_name"],
-                status="imported"
-            )
+        ImportResultDB.create(
+            filepath=filepath,
+            file_hash=current_hash,
+            success_count=actual_success,
+            skip_count=actual_skip,
+            total_rows=actual_success + actual_skip,
+            errors=errors,
+            warnings=warnings,
+            conflict_batches=conflict_batches,
+            stock_warnings=stock_warnings,
+            operator_id=self.auth.current_user["id"],
+            operator_name=self.auth.current_user["display_name"],
+            status="imported"
+        )
 
         if current_hash in self._preview_cache:
             del self._preview_cache[current_hash]
