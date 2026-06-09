@@ -3082,6 +3082,197 @@ def run_tests():
         test_failed("撤销后导出和统计一致性", str(e) if str(e) else "未知错误")
         failed += 1
 
+    # Test 43: 冲突处理状态流转和审计日志回归测试
+    print("\n【测试 43】冲突处理状态流转和审计日志回归测试")
+    try:
+        reset_database()
+        auth.login("admin")
+
+        existing_reagent_id, _ = manager.create_reagent(
+            "回归测试试剂", "REGRESS-001", 100, "瓶",
+            expiration_date=(datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        )
+
+        conflict_csv = os.path.join(os.path.dirname(DB_PATH), "test_regress_conflict.csv")
+        with open(conflict_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["回归测试试剂", "REGRESS-001", "50", "瓶"])
+            writer.writerow(["新增无冲突试剂", "REGRESS-NEW", "30", "瓶"])
+
+        plan_result = csv_mgr.create_import_plan(conflict_csv)
+        assert plan_result["conflict_count"] == 1, f"冲突数应为1，实际{plan_result['conflict_count']}"
+
+        preview = csv_mgr.get_plan_preview(plan_result["plan_id"])
+        assert len(preview["conflict_items"]) == 1, "conflict_items应包含所有冲突（包括未处理的）"
+        assert len(preview["unresolved_conflict_items"]) == 1, "未处理冲突应为1"
+
+        conflict_item = preview["conflict_items"][0]
+        assert conflict_item["action"] == "conflict", "未处理冲突的action应为conflict"
+
+        csv_mgr.resolve_conflict(conflict_item["id"], "overwrite")
+
+        preview_after = csv_mgr.get_plan_preview(plan_result["plan_id"])
+        assert len(preview_after["conflict_items"]) == 1, "conflict_items仍应包含已处理的冲突"
+        assert len(preview_after["unresolved_conflict_items"]) == 0, "处理后unresolved_conflict_items应为空"
+
+        resolved_item = preview_after["conflict_items"][0]
+        assert resolved_item["conflict_resolution"] == "overwrite", "冲突处理应已保存为overwrite"
+        assert resolved_item["action"] == "update", "处理为overwrite后action应为update"
+
+        import_result = csv_mgr.confirm_import_plan(plan_result["plan_id"])
+        assert import_result["update_count"] == 1, "应更新1条"
+        assert import_result["new_count"] == 1, "应新增1条"
+
+        audit_logs = csv_mgr.get_audit_logs(limit=10)
+        confirm_log = next((l for l in audit_logs if l["action"] == "confirm_import"), None)
+        assert confirm_log is not None, "确认导入的审计日志应存在"
+        assert confirm_log["plan_id"] == plan_result["plan_id"], "审计日志plan_id应匹配"
+
+        conflict_resolutions = json.loads(confirm_log["conflict_resolutions"])
+        assert len(conflict_resolutions) == 1, "审计日志应包含1条冲突处理记录"
+        assert conflict_resolutions[0]["resolution"] == "overwrite", "审计日志中冲突处理应为overwrite"
+        assert conflict_resolutions[0]["batch_number"] == "REGRESS-001", "审计日志中批号应正确"
+
+        updated_reagent = ReagentDB.get_by_id(existing_reagent_id)
+        assert updated_reagent["quantity"] == 150, f"数量应更新为150，实际{updated_reagent['quantity']}"
+
+        new_reagent = ReagentDB.get_by_batch("REGRESS-NEW")
+        assert new_reagent is not None, "新试剂应已创建"
+        assert new_reagent["quantity"] == 30, "新试剂数量应为30"
+
+        test_passed("冲突处理状态流转和审计日志：状态同步正确，审计日志完整")
+        passed += 1
+
+        os.remove(conflict_csv)
+    except AssertionError as e:
+        test_failed("冲突处理状态流转和审计日志", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("冲突处理状态流转和审计日志", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 44: GUI 确认按钮状态同步回归测试
+    print("\n【测试 44】GUI 确认按钮状态同步回归测试")
+    try:
+        reset_database()
+        auth.login("admin")
+
+        existing_reagent_id, _ = manager.create_reagent(
+            "GUI测试试剂", "GUI-001", 100, "瓶",
+            expiration_date=(datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        )
+
+        gui_csv = os.path.join(os.path.dirname(DB_PATH), "test_gui_conflict.csv")
+        with open(gui_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["GUI测试试剂", "GUI-001", "50", "瓶"])
+
+        plan_result = csv_mgr.create_import_plan(gui_csv)
+        preview_before = csv_mgr.get_plan_preview(plan_result["plan_id"])
+
+        can_confirm_before = (preview_before["plan"]["status"] == "draft" and
+                              len(preview_before["unresolved_conflict_items"]) == 0)
+        assert not can_confirm_before, "未处理冲突时应不能确认"
+
+        status_text_before = f"（还有 {len(preview_before['unresolved_conflict_items'])} 条冲突待处理）"
+        assert "1" in status_text_before, "状态提示应显示还有1条冲突待处理"
+
+        conflict_item = preview_before["conflict_items"][0]
+        csv_mgr.resolve_conflict(conflict_item["id"], "overwrite")
+
+        preview_after = csv_mgr.get_plan_preview(plan_result["plan_id"])
+        can_confirm_after = (preview_after["plan"]["status"] == "draft" and
+                             len(preview_after["unresolved_conflict_items"]) == 0)
+        assert can_confirm_after, "处理完冲突后应能确认"
+
+        assert len(preview_after["conflict_items"]) == 1, "已处理的冲突仍应在conflict_items中（用于审计）"
+        assert len(preview_after["unresolved_conflict_items"]) == 0, "unresolved_conflict_items应为空"
+
+        import_result = csv_mgr.confirm_import_plan(plan_result["plan_id"])
+        assert import_result["update_count"] == 1, "导入应成功更新1条"
+
+        test_passed("GUI 确认按钮状态同步：冲突处理后按钮正确启用")
+        passed += 1
+
+        os.remove(gui_csv)
+    except AssertionError as e:
+        test_failed("GUI 确认按钮状态同步", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("GUI 确认按钮状态同步", str(e) if str(e) else "未知错误")
+        failed += 1
+
+    # Test 45: 跨重启恢复冲突处理状态回归测试
+    print("\n【测试 45】跨重启恢复冲突处理状态回归测试")
+    try:
+        reset_database()
+        auth.login("admin")
+
+        existing_reagent_id, _ = manager.create_reagent(
+            "重启测试试剂", "REBOOT-001", 100, "瓶",
+            expiration_date=(datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+        )
+
+        reboot_csv = os.path.join(os.path.dirname(DB_PATH), "test_reboot_conflict.csv")
+        with open(reboot_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["试剂名称", "批号", "数量", "单位"])
+            writer.writerow(["重启测试试剂", "REBOOT-001", "50", "瓶"])
+            writer.writerow(["重启新试剂", "REBOOT-NEW", "20", "瓶"])
+
+        plan_result = csv_mgr.create_import_plan(reboot_csv)
+        preview_before = csv_mgr.get_plan_preview(plan_result["plan_id"])
+        conflict_item = preview_before["conflict_items"][0]
+
+        csv_mgr.resolve_conflict(conflict_item["id"], "keep_existing")
+
+        preview_after_resolve = csv_mgr.get_plan_preview(plan_result["plan_id"])
+        assert len(preview_after_resolve["unresolved_conflict_items"]) == 0, "处理后重启前unresolved应为空"
+        resolved_item = preview_after_resolve["conflict_items"][0]
+        assert resolved_item["conflict_resolution"] == "keep_existing", "重启前冲突处理应已保存"
+        assert resolved_item["action"] == "skip", "处理为keep_existing后action应为skip"
+
+        close_db()
+        init_database()
+        auth.login("admin")
+        csv_mgr = CSVManager(auth)
+
+        preview_after_reboot = csv_mgr.get_plan_preview(plan_result["plan_id"])
+        assert preview_after_reboot is not None, "重启后方案应仍存在"
+        assert preview_after_reboot["plan"]["status"] == "draft", "重启后方案状态应为draft"
+        assert len(preview_after_reboot["conflict_items"]) == 1, "重启后冲突条目应保留"
+        assert len(preview_after_reboot["unresolved_conflict_items"]) == 0, "重启后未处理冲突应为0"
+
+        item_after_reboot = preview_after_reboot["conflict_items"][0]
+        assert item_after_reboot["conflict_resolution"] == "keep_existing", "重启后冲突处理选择应保留"
+        assert item_after_reboot["action"] == "skip", "重启后action应保持为skip"
+
+        import_result = csv_mgr.confirm_import_plan(plan_result["plan_id"])
+        assert import_result["skip_count"] == 1, "keep_existing应跳过1条"
+        assert import_result["new_count"] == 1, "应新增1条"
+        assert import_result["update_count"] == 0, "keep_existing不应更新"
+
+        existing_after = ReagentDB.get_by_id(existing_reagent_id)
+        assert existing_after["quantity"] == 100, "keep_existing时原试剂数量应保持100"
+
+        audit_logs = csv_mgr.get_audit_logs(limit=10)
+        confirm_log = next((l for l in audit_logs if l["action"] == "confirm_import"), None)
+        conflict_resolutions = json.loads(confirm_log["conflict_resolutions"])
+        assert conflict_resolutions[0]["resolution"] == "keep_existing", "审计日志中应为keep_existing"
+
+        test_passed("跨重启恢复冲突处理状态：重启后状态一致，可继续确认")
+        passed += 1
+
+        os.remove(reboot_csv)
+    except AssertionError as e:
+        test_failed("跨重启恢复冲突处理状态", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("跨重启恢复冲突处理状态", str(e) if str(e) else "未知错误")
+        failed += 1
+
     # 清理测试数据库
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)

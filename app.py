@@ -2894,7 +2894,7 @@ class ReagentManagementApp:
             can_confirm = False
             if has_plan:
                 plan = self.csv_manager.get_plan_preview(self._current_plan_id)
-                if plan and plan["plan"]["status"] == "draft" and not plan["conflict_items"]:
+                if plan and plan["plan"]["status"] == "draft" and not plan["unresolved_conflict_items"]:
                     can_confirm = True
             self.btn_confirm_import.configure(state='normal' if can_confirm else 'disabled')
 
@@ -2914,8 +2914,8 @@ class ReagentManagementApp:
             elif has_plan:
                 plan = self.csv_manager.get_plan_preview(self._current_plan_id)
                 if plan:
-                    if plan["conflict_items"]:
-                        self.import_status_var.set(f"⚠️ 方案：{plan['plan']['batch_no']}（还有 {len(plan['conflict_items'])} 条冲突待处理）")
+                    if plan["unresolved_conflict_items"]:
+                        self.import_status_var.set(f"⚠️ 方案：{plan['plan']['batch_no']}（还有 {len(plan['unresolved_conflict_items'])} 条冲突待处理）")
                     elif plan["plan"]["status"] == "draft":
                         self.import_status_var.set(f"✅ 方案：{plan['plan']['batch_no']}（就绪，可确认导入）")
                     elif plan["plan"]["status"] == "confirmed":

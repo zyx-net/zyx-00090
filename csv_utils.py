@@ -414,14 +414,12 @@ class CSVManager:
         if not item.get("conflict_type"):
             raise ValueError("该记录不是冲突记录")
 
-        success = ImportPlanItemDB.update_conflict_resolution(item_id, resolution)
+        if resolution == "overwrite":
+            target_action = "update"
+        else:
+            target_action = "skip"
 
-        if success and resolution == "overwrite":
-            ImportPlanItemDB.update_action(item_id, "update")
-        elif success and resolution in ["skip", "keep_existing"]:
-            ImportPlanItemDB.update_action(item_id, "skip")
-
-        return success
+        return ImportPlanItemDB.resolve_conflict_atomic(item_id, resolution, target_action)
 
     def resolve_all_conflicts(self, plan_id: int, default_resolution: str = "skip") -> int:
         self._check_permission("import_csv")

@@ -1389,6 +1389,21 @@ class ImportPlanItemDB:
             conn.close()
 
     @staticmethod
+    def resolve_conflict_atomic(item_id: int, resolution: str, action: str) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE import_plan_items
+                SET conflict_resolution = ?, action = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (resolution, action, item_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    @staticmethod
     def update_after_import(item_id: int, reagent_id: int = None,
                             snapshot_after: str = None, action: str = None) -> bool:
         conn = get_connection()
@@ -1448,7 +1463,7 @@ class ImportPlanItemDB:
         try:
             cursor.execute("""
                 SELECT * FROM import_plan_items
-                WHERE plan_id = ? AND action = 'conflict'
+                WHERE plan_id = ? AND conflict_type IS NOT NULL
                 ORDER BY row_num ASC
             """, (plan_id,))
             rows = cursor.fetchall()
