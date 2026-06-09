@@ -2128,6 +2128,101 @@ def run_tests():
         test_failed("预检缓存复用", str(e) if str(e) else "未知错误")
         failed += 1
 
+    # Test 31: GUI 构建测试（登录后主界面不崩溃、导入页可打开、无权限角色禁用提示）
+    print("\n【测试 31】GUI 构建测试（Tk 界面初始化验证）")
+    try:
+        import tkinter as tk
+        from app import ReagentManagementApp
+
+        print("  测试31a: 管理员登录后构建主界面不崩溃...")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ReagentManagementApp(root)
+            app.auth.login('admin')
+            app.setup_main_ui()
+
+            assert hasattr(app, 'status_var'), "status_var 应已初始化"
+            assert app.status_var.get() is not None, "status_var 不应为 None"
+            assert len(app.status_var.get()) > 0, "status_var 不应为空字符串"
+            assert hasattr(app, 'import_status_var'), "import_status_var 应已初始化"
+            assert hasattr(app, 'btn_preview'), "btn_preview 应已创建"
+            assert hasattr(app, 'btn_import'), "btn_import 应已创建"
+            assert hasattr(app, 'btn_reset_preview'), "btn_reset_preview 应已创建"
+
+            tab_count = len(app.notebook.tabs())
+            assert tab_count == 8, f"应创建8个标签页，实际{tab_count}个"
+            test_passed("管理员登录后主界面构建成功，所有组件已初始化")
+            passed += 1
+
+            print("  测试31b: 导入页可正常切换和访问...")
+            app.notebook.select(app.tab_import_export)
+            tab_text = app.notebook.tab(app.notebook.select(), 'text')
+            assert tab_text == '导入导出', f"选中标签页应为'导入导出'，实际'{tab_text}'"
+
+            import_status = app.import_status_var.get()
+            assert '请选择CSV文件' in import_status, f"导入状态提示应包含'请选择CSV文件'，实际'{import_status}'"
+
+            btn_preview_state = str(app.btn_preview.cget('state'))
+            btn_import_state = str(app.btn_import.cget('state'))
+            btn_reset_state = str(app.btn_reset_preview.cget('state'))
+            assert btn_preview_state == 'disabled', f"未选文件时预检按钮应禁用，实际{btn_preview_state}"
+            assert btn_import_state == 'disabled', f"未预检时导入按钮应禁用，实际{btn_import_state}"
+            assert btn_reset_state == 'disabled', f"无结果时重置按钮应禁用，实际{btn_reset_state}"
+            test_passed("导入页可正常访问，按钮初始状态正确")
+            passed += 1
+        finally:
+            root.destroy()
+
+        print("  测试31c: 实验员登录后看到禁用提示...")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ReagentManagementApp(root)
+            app.auth.login('lab_staff')
+            app.setup_main_ui()
+
+            assert hasattr(app, 'status_var'), "status_var 应已初始化"
+            app.notebook.select(app.tab_import_export)
+
+            assert not app.auth.has_permission('import_csv'), "实验员不应有导入权限"
+            assert not hasattr(app, 'btn_preview'), "无权限时不应创建预检按钮"
+            assert not hasattr(app, 'btn_import'), "无权限时不应创建导入按钮"
+            assert not hasattr(app, 'btn_reset_preview'), "无权限时不应创建重置按钮"
+            test_passed("实验员登录后导入页显示禁用提示，无操作按钮")
+            passed += 1
+        finally:
+            root.destroy()
+
+        print("  测试31d: 审核员登录后看到禁用提示...")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ReagentManagementApp(root)
+            app.auth.login('auditor')
+            app.setup_main_ui()
+
+            assert hasattr(app, 'status_var'), "status_var 应已初始化"
+            app.notebook.select(app.tab_import_export)
+
+            assert not app.auth.has_permission('import_csv'), "审核员不应有导入权限"
+            assert not hasattr(app, 'btn_preview'), "无权限时不应创建预检按钮"
+            assert not hasattr(app, 'btn_import'), "无权限时不应创建导入按钮"
+            assert not hasattr(app, 'btn_reset_preview'), "无权限时不应创建重置按钮"
+            test_passed("审核员登录后导入页显示禁用提示，无操作按钮")
+            passed += 1
+        finally:
+            root.destroy()
+
+    except AssertionError as e:
+        test_failed("GUI 构建", str(e) if str(e) else "断言失败")
+        failed += 1
+    except Exception as e:
+        test_failed("GUI 构建", str(e) if str(e) else "未知错误")
+        import traceback
+        traceback.print_exc()
+        failed += 1
+
     # 清理测试数据库
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)

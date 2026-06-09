@@ -115,7 +115,6 @@ class ReagentManagementApp:
         ttk.Button(user_info_frame, text="切换用户", command=self.switch_user).pack(side='left', padx=10)
 
         self.notebook = ttk.Notebook(main_frame)
-        self.notebook.pack(fill='both', expand=True)
 
         self.tab_inventory = ttk.Frame(self.notebook)
         self.tab_reservation = ttk.Frame(self.notebook)
@@ -135,6 +134,17 @@ class ReagentManagementApp:
         self.notebook.add(self.tab_ledger, text='库存台账')
         self.notebook.add(self.tab_import_export, text='导入导出')
 
+        status_bar = ttk.Frame(main_frame)
+        status_bar.pack(fill='x', side='bottom', pady=(10, 0))
+
+        self.status_var = tk.StringVar(value="就绪")
+        ttk.Label(status_bar, textvariable=self.status_var, font=('Microsoft YaHei', 9)).pack(side='left')
+
+        db_info = f"数据库：{os.path.basename(DB_PATH)}"
+        ttk.Label(status_bar, text=db_info, font=('Microsoft YaHei', 9)).pack(side='right')
+
+        self.notebook.pack(fill='both', expand=True)
+
         self.setup_inventory_tab()
         self.setup_reservation_tab()
         self.setup_approval_tab()
@@ -145,15 +155,6 @@ class ReagentManagementApp:
         self.setup_import_export_tab()
 
         self.notebook.bind('<<NotebookTabChanged>>', self.on_tab_changed)
-
-        status_bar = ttk.Frame(main_frame)
-        status_bar.pack(fill='x', pady=(10, 0))
-
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(status_bar, textvariable=self.status_var, font=('Microsoft YaHei', 9)).pack(side='left')
-
-        db_info = f"数据库：{os.path.basename(DB_PATH)}"
-        ttk.Label(status_bar, text=db_info, font=('Microsoft YaHei', 9)).pack(side='right')
 
     def switch_user(self):
         if messagebox.askyesno("确认", "确定要切换用户吗？"):
