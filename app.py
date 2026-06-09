@@ -31,6 +31,9 @@ class ReagentManagementApp:
         self.selected_reservation_id = None
         self.selected_reservation_log_id = None
 
+        self._current_preview_hash = None
+        self._current_preview_result = None
+
         self.setup_styles()
         self.show_login_dialog()
 
@@ -1977,17 +1980,59 @@ class ReagentManagementApp:
 
         ttk.Label(main_frame, text="导入库存数据", font=('Microsoft YaHei', 14, 'bold')).pack(pady=(0, 20))
 
-        if not self.auth.has_permission("import_csv"):
-            ttk.Label(main_frame, text="当前角色无 CSV 导入权限", foreground='red').pack(pady=30)
+        has_import_perm = self.auth.has_permission("import_csv")
+
+        if not has_import_perm:
+            perm_frame = ttk.Frame(main_frame)
+            perm_frame.pack(pady=30)
+            ttk.Label(perm_frame, text="⛔", font=('Microsoft YaHei', 32)).pack(pady=10)
+            ttk.Label(perm_frame, text="当前角色无 CSV 导入和预检权限",
+                     font=('Microsoft YaHei', 12, 'bold'), foreground='red').pack(pady=5)
+            ttk.Label(perm_frame,
+                     text=f"您的角色：{self.auth.get_role_display()}",
+                     foreground='#666').pack(pady=2)
+            ttk.Label(perm_frame,
+                     text="如需导入数据，请联系管理员或授权用户操作。",
+                     foreground='#666').pack(pady=10)
+
+            history_frame = ttk.LabelFrame(main_frame, text="导入历史记录（只读）", padding=10)
+            history_frame.pack(fill='both', expand=True, pady=10)
+
+            history_tree = ttk.Treeview(history_frame, columns=("time", "operator", "file", "success", "skip", "status"), show='headings')
+            headings = [
+                ("time", "操作时间", 150),
+                ("operator", "操作人", 80),
+                ("file", "文件名", 200),
+                ("success", "成功", 60),
+                ("skip", "跳过", 60),
+                ("status", "状态", 80)
+            ]
+            for col, text, width in headings:
+                history_tree.heading(col, text=text)
+                history_tree.column(col, width=width, anchor='center')
+            history_tree.pack(fill='both', expand=True)
+
+            try:
+                history = self.csv_manager.get_import_history(50)
+                status_map = {"previewed": "已预检", "imported": "已导入", "cancelled": "已取消"}
+                for h in history:
+                    filename = os.path.basename(h["filepath"])
+                    history_tree.insert('', 'end', values=(
+                        h["created_at"], h["operator_name"], filename,
+                        h["success_count"], h["skip_count"],
+                        status_map.get(h["status"], h["status"])
+                    ))
+            except Exception:
+                pass
             return
 
         file_frame = ttk.Frame(main_frame)
-        file_frame.pack(pady=20)
+        file_frame.pack(fill='x', pady=(10, 5))
 
         ttk.Label(file_frame, text="选择 CSV 文件：").pack(side='left', padx=5)
         self.import_path_var = tk.StringVar()
         path_entry = ttk.Entry(file_frame, textvariable=self.import_path_var, width=50)
-        path_entry.pack(side='left', padx=5)
+        path_entry.pack(side='left', padx=5, fill='x', expand=True)
 
         def browse_file():
             filepath = filedialog.askopenfilename(
@@ -1996,50 +2041,67 @@ class ReagentManagementApp:
             )
             if filepath:
                 self.import_path_var.set(filepath)
+                self._current_preview_hash = None
+                self._current_preview_result = None
+                self._update_import_buttons()
 
         ttk.Button(file_frame, text="浏览...", command=browse_file).pack(side='left', padx=5)
 
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(pady=20)
+        btn_frame.pack(pady=10)
 
-        def do_import():
-            filepath = self.import_path_var.get().strip()
-            if not filepath:
-                messagebox.showwarning("提示", "请先选择 CSV 文件")
-                return
-            if not os.path.exists(filepath):
-                messagebox.showerror("错误", "文件不存在")
-                return
+        self.btn_preview = ttk.Button(btn_frame, text="🔍 预检导入", command=self._do_preview, width=15, state='disabled')
+        self.btn_preview.pack(side='left', padx=5, ipadx=5, ipady=8)
 
-            if not messagebox.askyesno("确认", "导入数据会自动创建新试剂记录，确定继续吗？"):
-                return
+        self.btn_import = ttk.Button(btn_frame, text="✅ 开始导入", command=self._do_import, width=15, state='disabled')
+        self.btn_import.pack(side='left', padx=5, ipadx=5, ipady=8)
 
-            try:
-                success, skipped, errors, warnings = self.csv_manager.import_reagents(filepath)
-                msg = f"导入完成！\n成功：{success} 条\n跳过：{skipped} 条"
-                if warnings:
-                    msg += f"\n\n⚠️  冲突警告（{len(warnings)} 条）：\n" + "\n".join(warnings[:5])
-                    if len(warnings) > 5:
-                        msg += f"\n... 共 {len(warnings)} 条警告"
-                if errors:
-                    msg += f"\n\n错误详情：\n" + "\n".join(errors[:10])
-                    if len(errors) > 10:
-                        msg += f"\n... 共 {len(errors)} 条错误"
-                if warnings:
-                    messagebox.showwarning("导入结果（含警告）", msg)
-                else:
-                    messagebox.showinfo("导入结果", msg)
-                self.refresh_inventory()
-                self.refresh_history()
-            except ValueError as e:
-                messagebox.showerror("错误", str(e))
-            except Exception as e:
-                messagebox.showerror("错误", f"导入失败：{str(e)}")
+        self.btn_reset_preview = ttk.Button(btn_frame, text="🔄 重新预检", command=self._reset_preview, width=15, state='disabled')
+        self.btn_reset_preview.pack(side='left', padx=5, ipadx=5, ipady=8)
 
-        ttk.Button(btn_frame, text="开始导入", command=do_import, width=15).pack(ipadx=10, ipady=10)
+        self.import_status_var = tk.StringVar(value="请选择CSV文件后点击\"预检导入\"")
+        status_label = ttk.Label(main_frame, textvariable=self.import_status_var, foreground='#1976D2')
+        status_label.pack(pady=5)
+
+        result_paned = ttk.PanedWindow(main_frame, orient='vertical')
+        result_paned.pack(fill='both', expand=True, pady=5)
+
+        preview_frame = ttk.LabelFrame(result_paned, text="预检/导入结果", padding=10)
+        result_paned.add(preview_frame, weight=3)
+
+        self.preview_text = tk.Text(preview_frame, height=15, font=('Consolas', 10), wrap='none')
+        preview_scroll_y = ttk.Scrollbar(preview_frame, orient='vertical', command=self.preview_text.yview)
+        preview_scroll_x = ttk.Scrollbar(preview_frame, orient='horizontal', command=self.preview_text.xview)
+        self.preview_text.configure(yscrollcommand=preview_scroll_y.set, xscrollcommand=preview_scroll_x.set)
+        self.preview_text.pack(side='left', fill='both', expand=True)
+        preview_scroll_y.pack(side='right', fill='y')
+        preview_scroll_x.pack(side='bottom', fill='x')
+        self.preview_text.insert('1.0', "预检结果将显示在这里...")
+        self.preview_text.configure(state='disabled')
+
+        history_frame = ttk.LabelFrame(result_paned, text="导入历史记录", padding=10)
+        result_paned.add(history_frame, weight=2)
+
+        self.import_history_tree = ttk.Treeview(history_frame, columns=("time", "operator", "file", "success", "skip", "status"), show='headings')
+        headings = [
+            ("time", "操作时间", 150),
+            ("operator", "操作人", 80),
+            ("file", "文件名", 200),
+            ("success", "成功", 60),
+            ("skip", "跳过", 60),
+            ("status", "状态", 80)
+        ]
+        for col, text, width in headings:
+            self.import_history_tree.heading(col, text=text)
+            self.import_history_tree.column(col, width=width, anchor='center')
+
+        history_scroll = ttk.Scrollbar(history_frame, orient='vertical', command=self.import_history_tree.yview)
+        self.import_history_tree.configure(yscrollcommand=history_scroll.set)
+        self.import_history_tree.pack(side='left', fill='both', expand=True)
+        history_scroll.pack(side='right', fill='y')
 
         info = ttk.LabelFrame(main_frame, text="CSV 格式要求", padding=15)
-        info.pack(fill='x', pady=30)
+        info.pack(fill='x', pady=10)
 
         required = ["试剂名称", "批号", "数量", "单位"]
         optional = ["过期日期", "低库存阈值", "规格", "生产厂商", "储存条件", "备注"]
@@ -2049,7 +2111,220 @@ class ReagentManagementApp:
         ttk.Label(info, text="• 过期日期格式：YYYY-MM-DD，如 2027-12-31", wraplength=800).pack(anchor='w', pady=2)
         ttk.Label(info, text="• 数量必须是正整数", wraplength=800).pack(anchor='w', pady=2)
         ttk.Label(info, text="• 相同名称和批号的试剂不会重复导入", wraplength=800).pack(anchor='w', pady=2)
-        ttk.Label(info, text="• 建议先生成样例文件查看格式", wraplength=800).pack(anchor='w', pady=2)
+        ttk.Label(info, text="• 预检不写入数据库，仅用于验证数据", wraplength=800, foreground='#1976D2').pack(anchor='w', pady=2)
+        ttk.Label(info, text="• 建议先预检再导入，确认数据无误后执行导入", wraplength=800, foreground='#1976D2').pack(anchor='w', pady=2)
+
+        self._refresh_import_history()
+
+        self.import_path_var.trace_add('write', lambda *args: self._update_import_buttons())
+        self._update_import_buttons()
+
+    def _update_import_buttons(self):
+        filepath = self.import_path_var.get().strip() if hasattr(self, 'import_path_var') else ""
+        file_exists = filepath and os.path.exists(filepath)
+
+        if hasattr(self, 'btn_preview'):
+            self.btn_preview.configure(state='normal' if file_exists else 'disabled')
+
+        if hasattr(self, 'btn_import'):
+            has_preview = self._current_preview_hash is not None
+            self.btn_import.configure(state='normal' if (file_exists and has_preview) else 'disabled')
+
+        if hasattr(self, 'btn_reset_preview'):
+            has_preview = self._current_preview_hash is not None
+            self.btn_reset_preview.configure(state='normal' if has_preview else 'disabled')
+
+        if hasattr(self, 'import_status_var'):
+            if not filepath:
+                self.import_status_var.set("请选择CSV文件后点击\"预检导入\"")
+            elif not file_exists:
+                self.import_status_var.set("文件不存在，请重新选择")
+            elif self._current_preview_hash:
+                file_changed, _ = self.csv_manager.check_file_changed(filepath, self._current_preview_hash)
+                if file_changed:
+                    self.import_status_var.set("⚠️ 文件已修改，请重新预检")
+                else:
+                    self.import_status_var.set("✅ 已完成预检，可执行导入")
+            else:
+                self.import_status_var.set("请点击\"预检导入\"验证数据")
+
+    def _set_preview_text(self, text):
+        self.preview_text.configure(state='normal')
+        self.preview_text.delete('1.0', 'end')
+        self.preview_text.insert('1.0', text)
+        self.preview_text.configure(state='disabled')
+
+    def _do_preview(self):
+        filepath = self.import_path_var.get().strip()
+        if not filepath:
+            messagebox.showwarning("提示", "请先选择 CSV 文件")
+            return
+        if not os.path.exists(filepath):
+            messagebox.showerror("错误", "文件不存在")
+            return
+
+        try:
+            self.set_status("正在预检数据...")
+            self.root.update_idletasks()
+
+            preview_result = self.csv_manager.preview_import(filepath)
+            self._current_preview_hash = preview_result["file_hash"]
+            self._current_preview_result = preview_result
+
+            summary = self.csv_manager.get_preview_summary(preview_result)
+            self._set_preview_text(summary)
+
+            if preview_result.get("is_cached"):
+                self.import_status_var.set("ℹ️ 使用缓存的预检结果")
+            else:
+                self.import_status_var.set("✅ 预检完成，可执行导入")
+
+            self._update_import_buttons()
+            self._refresh_import_history()
+            self.set_status("预检完成")
+
+            if preview_result["stock_warnings"] or preview_result["conflict_batches"]:
+                messagebox.showwarning(
+                    "预检完成（含警告）",
+                    f"预检完成，发现 {len(preview_result['conflict_batches'])} 个批号冲突，"
+                    f"{len(preview_result['stock_warnings'])} 条库存警告。\n"
+                    "请在下方查看详细信息后再决定是否导入。"
+                )
+            else:
+                messagebox.showinfo(
+                    "预检完成",
+                    f"预检完成！\n\n"
+                    f"预计新增：{preview_result['success_count']} 条\n"
+                    f"预计跳过：{preview_result['skip_count']} 条\n\n"
+                    "请在下方查看详细信息后再决定是否导入。"
+                )
+        except PermissionError as e:
+            messagebox.showerror("权限不足", str(e))
+            self.set_status("预检失败：权限不足")
+        except Exception as e:
+            messagebox.showerror("预检失败", f"预检过程中发生错误：{str(e)}")
+            self.set_status("预检失败")
+
+    def _reset_preview(self):
+        self._current_preview_hash = None
+        self._current_preview_result = None
+        self._set_preview_text("预检结果已清除，可重新执行预检...")
+        self._update_import_buttons()
+
+    def _do_import(self):
+        filepath = self.import_path_var.get().strip()
+        if not filepath:
+            messagebox.showwarning("提示", "请先选择 CSV 文件")
+            return
+        if not os.path.exists(filepath):
+            messagebox.showerror("错误", "文件不存在")
+            return
+
+        if self._current_preview_hash:
+            file_changed, _ = self.csv_manager.check_file_changed(filepath, self._current_preview_hash)
+            if file_changed:
+                if not messagebox.askyesno(
+                    "文件已修改",
+                    "检测到文件内容已变化，预检结果可能已失效。\n\n"
+                    "是否重新执行预检？\n\n"
+                    "是 - 重新预检\n"
+                    "否 - 继续使用当前文件（将重新校验）"
+                ):
+                    self._current_preview_hash = None
+                else:
+                    self._do_preview()
+                    return
+
+        if not messagebox.askyesno(
+            "确认导入",
+            "即将执行正式导入操作。\n\n"
+            "导入数据会自动创建新试剂记录，并写入操作日志和台账。\n"
+            "此操作不可撤销，请确认数据无误。\n\n"
+            "确定继续吗？"
+        ):
+            return
+
+        try:
+            self.set_status("正在导入数据...")
+            self.root.update_idletasks()
+
+            use_cached = self._current_preview_hash is not None
+            expected_hash = self._current_preview_hash if use_cached else None
+
+            success, skipped, errors, warnings = self.csv_manager.import_reagents(
+                filepath, use_cached=use_cached, expected_hash=expected_hash
+            )
+
+            summary = self.csv_manager.get_import_summary(success, skipped, errors, warnings)
+            self._set_preview_text(summary)
+
+            self._current_preview_hash = None
+            self._current_preview_result = None
+            self._update_import_buttons()
+            self._refresh_import_history()
+            self.refresh_inventory()
+            self.refresh_history()
+            self.refresh_ledger()
+            self.set_status("导入完成")
+
+            if warnings or errors:
+                messagebox.showwarning(
+                    "导入完成（含警告/错误）",
+                    f"导入完成！\n\n"
+                    f"成功：{success} 条\n"
+                    f"跳过：{skipped} 条\n\n"
+                    f"警告：{len(warnings)} 条\n"
+                    f"错误：{len(errors)} 条\n\n"
+                    "请在下方查看详细结果。"
+                )
+            else:
+                messagebox.showinfo(
+                    "导入完成",
+                    f"导入完成！\n\n"
+                    f"成功导入：{success} 条\n"
+                    f"跳过：{skipped} 条\n\n"
+                    "导入结果已记录到日志和台账。"
+                )
+        except PermissionError as e:
+            messagebox.showerror("权限不足", str(e))
+            self.set_status("导入失败：权限不足")
+        except ValueError as e:
+            if "文件内容已变化" in str(e):
+                if messagebox.askyesno("文件已变化", f"{str(e)}\n\n是否重新执行预检？"):
+                    self._do_preview()
+            else:
+                messagebox.showerror("错误", str(e))
+            self.set_status("导入失败")
+        except Exception as e:
+            messagebox.showerror("导入失败", f"导入过程中发生错误：{str(e)}")
+            self.set_status("导入失败")
+
+    def _refresh_import_history(self):
+        if not hasattr(self, 'import_history_tree'):
+            return
+
+        for item in self.import_history_tree.get_children():
+            self.import_history_tree.delete(item)
+
+        try:
+            history = self.csv_manager.get_import_history(50)
+            status_map = {"previewed": "已预检", "imported": "已导入", "cancelled": "已取消"}
+            status_tags = {"previewed": "previewed", "imported": "imported", "cancelled": "cancelled"}
+
+            for h in history:
+                filename = os.path.basename(h["filepath"])
+                status_display = status_map.get(h["status"], h["status"])
+                tag = status_tags.get(h["status"], "")
+                self.import_history_tree.insert('', 'end', values=(
+                    h["created_at"], h["operator_name"], filename,
+                    h["success_count"], h["skip_count"], status_display
+                ), tags=(tag,))
+
+            self.import_history_tree.tag_configure('imported', background='#d4edda')
+            self.import_history_tree.tag_configure('previewed', background='#fff3cd')
+            self.import_history_tree.tag_configure('cancelled', background='#e2e3e5')
+        except Exception:
+            pass
 
     def setup_sample_tab(self, frame):
         main_frame = ttk.Frame(frame, padding=20)

@@ -151,6 +151,27 @@ def init_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS import_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filepath TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            skip_count INTEGER NOT NULL DEFAULT 0,
+            total_rows INTEGER NOT NULL DEFAULT 0,
+            errors TEXT,
+            warnings TEXT,
+            conflict_batches TEXT,
+            stock_warnings TEXT,
+            operator_id INTEGER NOT NULL,
+            operator_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('previewed', 'imported', 'cancelled')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (operator_id) REFERENCES users(id)
+        )
+    """)
+
     cursor.execute("PRAGMA table_info(reagents)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'locked_quantity' not in columns:
@@ -892,6 +913,125 @@ class ReservationLogDB:
             """, (log_id,))
             conn.commit()
             return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+
+class ImportResultDB:
+    @staticmethod
+    def create(filepath: str, file_hash: str, success_count: int, skip_count: int,
+               total_rows: int, errors: List[str] = None, warnings: List[str] = None,
+               conflict_batches: List[str] = None, stock_warnings: List[str] = None,
+               operator_id: int = None, operator_name: str = "",
+               status: str = "previewed") -> int:
+        import json
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO import_results (
+                    filepath, file_hash, success_count, skip_count, total_rows,
+                    errors, warnings, conflict_batches, stock_warnings,
+                    operator_id, operator_name, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                filepath, file_hash, success_count, skip_count, total_rows,
+                json.dumps(errors or [], ensure_ascii=False),
+                json.dumps(warnings or [], ensure_ascii=False),
+                json.dumps(conflict_batches or [], ensure_ascii=False),
+                json.dumps(stock_warnings or [], ensure_ascii=False),
+                operator_id, operator_name, status
+            ))
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_id(result_id: int) -> Optional[Dict]:
+        import json
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM import_results WHERE id = ?", (result_id,))
+            row = cursor.fetchone()
+            if row:
+                result = dict(row)
+                for key in ['errors', 'warnings', 'conflict_batches', 'stock_warnings']:
+                    if result.get(key):
+                        result[key] = json.loads(result[key])
+                return result
+            return None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_file_hash(file_hash: str) -> Optional[Dict]:
+        import json
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT * FROM import_results
+                WHERE file_hash = ? AND status IN ('previewed', 'imported')
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (file_hash,))
+            row = cursor.fetchone()
+            if row:
+                result = dict(row)
+                for key in ['errors', 'warnings', 'conflict_batches', 'stock_warnings']:
+                    if result.get(key):
+                        result[key] = json.loads(result[key])
+                return result
+            return None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update_status(result_id: int, status: str, success_count: int = None,
+                      skip_count: int = None) -> bool:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            fields = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+            params = [status]
+            if success_count is not None:
+                fields.append("success_count = ?")
+                params.append(success_count)
+            if skip_count is not None:
+                fields.append("skip_count = ?")
+                params.append(skip_count)
+            params.append(result_id)
+            cursor.execute(
+                f"UPDATE import_results SET {', '.join(fields)} WHERE id = ?",
+                params
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_all(limit: int = 100) -> List[Dict]:
+        import json
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT * FROM import_results
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
+            results = []
+            for row in rows:
+                result = dict(row)
+                for key in ['errors', 'warnings', 'conflict_batches', 'stock_warnings']:
+                    if result.get(key):
+                        result[key] = json.loads(result[key])
+                results.append(result)
+            return results
         finally:
             conn.close()
 
