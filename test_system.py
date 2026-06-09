@@ -4,6 +4,10 @@ import csv
 import sqlite3
 from datetime import datetime, timedelta
 
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from database import (init_database, DB_PATH, ReagentDB, OperationDB, LedgerDB,
@@ -2303,9 +2307,9 @@ def run_tests():
 
             assert hasattr(app, 'status_var'), "status_var 应已初始化"
             assert not app.auth.has_permission('import_csv'), "实验员不应有导入权限"
-            assert not hasattr(app, 'btn_preview'), "无权限时不应创建预检按钮"
-            assert not hasattr(app, 'btn_import'), "无权限时不应创建导入按钮"
-            assert not hasattr(app, 'btn_reset_preview'), "无权限时不应创建重置按钮"
+            assert not hasattr(app, 'btn_create_plan'), "无权限时不应创建创建方案按钮"
+            assert not hasattr(app, 'btn_confirm_import'), "无权限时不应创建确认导入按钮"
+            assert not hasattr(app, 'btn_cancel_plan'), "无权限时不应创建取消方案按钮"
         finally:
             root.destroy()
 
